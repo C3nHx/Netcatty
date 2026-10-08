@@ -9,13 +9,8 @@ const readWorkflow = (name) => fs.readFileSync(path.join(workflowsDir, name), "u
 const testWorkflow = readWorkflow("test.yml");
 const buildWorkflow = readWorkflow("build.yml");
 const aiWorkflow = readWorkflow("ai-automation.yml");
-const etWorkflow = readWorkflow("build-et-binaries.yml");
 const appBuilderPatch = fs.readFileSync(
   path.join(__dirname, "..", "patches", "app-builder-lib+26.15.2.patch"),
-  "utf8",
-);
-const windowsEtBuild = fs.readFileSync(
-  path.join(__dirname, "build-et", "build-windows.ps1"),
   "utf8",
 );
 const homebrewBump = fs.readFileSync(
@@ -326,54 +321,10 @@ test("permission handoffs use the established ready-for-human label", () => {
   assert.match(aiWorkflow, /-f 'labels\[\]=ready-for-human'/);
 });
 
-test("ET binary validation runs once and retries transient container pulls", () => {
-  assert.match(etWorkflow, /push:\s*\n\s*branches:\s*\n\s*- main/);
-  assert.doesNotMatch(etWorkflow, /branches:\s*\n\s*- "\*\*"/);
-  assert.match(etWorkflow, /Pull build container with retry/g);
-  assert.match(etWorkflow, /docker pull/);
-  assert.match(etWorkflow, /--pull=never/);
-  assert.match(etWorkflow, /Restore vcpkg download cache/g);
-  assert.match(etWorkflow, /VCPKG_DOWNLOADS/g);
-  assert.match(windowsEtBuild, /Invoke-WithRetry/);
-});
-
-test("ET pull requests reuse exact platform builds without weakening release builds", () => {
-  const buildJobs = [
-    ["linux-x64", etWorkflow.match(/\n  build-linux-x64:\n[\s\S]*?(?=\n  build-linux-arm64:)/)?.[0]],
-    ["linux-arm64", etWorkflow.match(/\n  build-linux-arm64:\n[\s\S]*?(?=\n  build-macos-universal:)/)?.[0]],
-    ["macos-universal", etWorkflow.match(/\n  build-macos-universal:\n[\s\S]*?(?=\n  build-windows-x64:)/)?.[0]],
-    ["windows-x64", etWorkflow.match(/\n  build-windows-x64:\n[\s\S]*?(?=\n  # ------------------------------------------------------------------\n  # Windows arm64)/)?.[0]],
-  ];
-  const skipOnExactPrCacheHit =
-    "if: github.event_name != 'pull_request' || steps.et-build-cache.outputs.cache-hit != 'true'";
-
-  for (const [platform, job] of buildJobs) {
-    assert.ok(job, `${platform} ET build job must be readable`);
-    assert.match(job, /- name: Restore cached PR build\s*\n\s*id: et-build-cache/);
-    assert.match(job, /if: github\.event_name == 'pull_request'/);
-    assert.match(job, /path: out\//);
-    assert.match(
-      job,
-      /key: et-pr-build-v1-\$\{\{ runner\.os \}\}-\$\{\{ runner\.arch \}\}-\$\{\{ env\.ET_REF \}\}-\$\{\{ hashFiles\('\.github\/workflows\/build-et-binaries\.yml', 'scripts\/build-et\/\*\*'\) \}\}/,
-    );
-    assert.ok(job.includes(skipOnExactPrCacheHit), `${platform} must skip compilation on an exact PR cache hit`);
-    assert.match(
-      job,
-      /- name: Upload artifact[\s\S]*?if-no-files-found: error/,
-      `${platform} must fail instead of publishing an empty cached build`,
-    );
-  }
-
-  assert.equal(
-    (etWorkflow.match(new RegExp(skipOnExactPrCacheHit.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")) ?? []).length,
-    14,
-    "all dependency setup and compilation steps must be skipped when the exact PR build is cached",
-  );
-  assert.doesNotMatch(
-    etWorkflow.match(/\n  release:\n[\s\S]*$/)?.[0] ?? "",
-    /et-build-cache|Restore cached PR build/,
-    "manual releases must never reuse PR build outputs",
-  );
+test("standalone ET publishing is removed from this Windows fork", () => {
+  assert.equal(fs.existsSync(path.join(workflowsDir, "build-et-binaries.yml")), false);
+  assert.doesNotMatch(buildWorkflow, /ET_BIN_RELEASE_TOKEN|release_repo:/);
+  assert.match(buildWorkflow, /node scripts\/fetch-et-binaries\.cjs --platform=win32 --arch=x64 --resolve-release/);
 });
 
 test("GitHub-owned actions use current Node 24 releases", () => {
