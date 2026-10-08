@@ -1,3 +1,16 @@
+diff --git a/node_modules/node-pty/lib/windowsPtyAgent.js b/node_modules/node-pty/lib/windowsPtyAgent.js
+index a358ffb..22ed18a 100644
+--- a/node_modules/node-pty/lib/windowsPtyAgent.js
++++ b/node_modules/node-pty/lib/windowsPtyAgent.js
+@@ -35,7 +35,7 @@
+         this._pid = 0;
+         this._innerPid = 0;
+         if (this._useConpty === undefined || this._useConpty === true) {
+-            this._useConpty = this._getWindowsBuildNumber() >= 18309;
++            this._useConpty = this._getWindowsBuildNumber() >= 17763;
+         }
+         if (this._useConpty) {
+             if (!conptyNative) {
 diff --git a/node_modules/node-pty/src/win/conpty.cc b/node_modules/node-pty/src/win/conpty.cc
 index 7b286d3..5423c8e 100644
 --- a/node_modules/node-pty/src/win/conpty.cc
@@ -15,3 +28,16 @@ index 4cef31c..4f03a0c 100644
 @@ -33 +33 @@ CONPTY_EXPORT HRESULT WINAPI ConptyResizePseudoConsole(HPCON hPC, COORD size);
 -CONPTY_EXPORT HRESULT WINAPI ConptyClearPseudoConsole(HPCON hPC);
 +CONPTY_EXPORT HRESULT WINAPI ConptyClearPseudoConsole(HPCON hPC, BOOL keepCursorRow);
+diff --git a/node_modules/node-pty/src/windowsPtyAgent.ts b/node_modules/node-pty/src/windowsPtyAgent.ts
+index d705444..fa14c82 100644
+--- a/node_modules/node-pty/src/windowsPtyAgent.ts
++++ b/node_modules/node-pty/src/windowsPtyAgent.ts
+@@ -59,7 +59,7 @@
+     conptyInheritCursor: boolean = false
+   ) {
+     if (this._useConpty === undefined || this._useConpty === true) {
+-      this._useConpty = this._getWindowsBuildNumber() >= 18309;
++      this._useConpty = this._getWindowsBuildNumber() >= 17763;
+     }
+     if (this._useConpty) {
+       if (!conptyNative) {
