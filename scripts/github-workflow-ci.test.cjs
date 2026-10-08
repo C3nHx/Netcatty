@@ -78,16 +78,12 @@ test("PR validation runs once per commit and includes a production build", () =>
     testWorkflow,
     /- name: Test terminal keyword highlight performance\s*\n\s*env:\s*\n\s*NETCATTY_TERMINAL_PERF_SHOW_WINDOW: "1"\s*\n\s*# GitHub-hosted runners do not configure Electron's SUID sandbox helper\.\s*\n\s*run: xvfb-run -a \.\/node_modules\/\.bin\/electron --no-sandbox scripts\/xterm-keyword-highlight-performance\.live\.test\.cjs/,
   );
-  assert.match(
-    buildWorkflow,
-    /- name: Test macOS Option column selection\s*\n\s*if: matrix\.name == 'macos'\s*\n\s*run: npm run test:xterm-macos-selection/,
-  );
   assert.match(testWorkflow, /- name: Build\s*\n\s*run: npm run build/);
   assert.doesNotMatch(testWorkflow, /\n  mosh-windows-conpty:/);
 });
 
 test("package release concurrency is isolated per tag", () => {
-  assert.match(buildWorkflow, /format\('release-\{0\}', github\.ref\)/);
+  assert.match(buildWorkflow, /format\('release-\{0\}', github\.ref_name\)/);
   assert.doesNotMatch(buildWorkflow, /&& 'release' \|\| github\.ref/);
 });
 
@@ -97,14 +93,15 @@ test("manual package validations do not share push concurrency", () => {
     /github\.event_name == 'workflow_dispatch' && format\('manual-\{0\}', github\.run_id\)/,
   );
   assert.ok(
-    buildWorkflow.indexOf("format('release-{0}', github.ref)") <
+    buildWorkflow.indexOf("format('release-{0}', github.ref_name)") <
       buildWorkflow.indexOf("format('manual-{0}', github.run_id)"),
     "publishing a tag manually must still share that tag's release group",
   );
 });
 
-test("package validation avoids duplicate branch runs and scopes PR builds", () => {
-  assert.match(buildWorkflow, /push:\s*\n\s*branches:\s*\n\s*- main/);
+test("package validation uses explicit releases and scopes PR builds", () => {
+  assert.match(buildWorkflow, /push:\s*\n\s*tags:/);
+  assert.doesNotMatch(buildWorkflow, /push:\s*\n\s*branches:/);
   assert.doesNotMatch(buildWorkflow, /branches:\s*\n\s*- "\*\*"/);
   assert.match(buildWorkflow, /pull_request:\s*\n\s*paths:/);
   assert.doesNotMatch(buildWorkflow, /\n  dedupe:/);
@@ -166,11 +163,11 @@ test("package validation avoids duplicate branch runs and scopes PR builds", () 
 });
 
 test("Windows packaging reuses its dependency install for the ConPTY smoke test", () => {
-  const packageMatrix = buildWorkflow.match(/\n  build:\n[\s\S]*?(?=\n  build-linux-x64:)/);
-  assert.ok(packageMatrix, "build matrix job must exist before build-linux-x64");
+  const packageMatrix = buildWorkflow.match(/\n  build:\n[\s\S]*?(?=\n  release:)/);
+  assert.ok(packageMatrix, "Windows build job must exist before release");
   assert.match(packageMatrix[0], /Compile ConPTY test helpers/);
   assert.match(packageMatrix[0], /Test Mosh handshake through ConPTY/);
-  assert.match(packageMatrix[0], /if: matrix\.name == 'windows'/);
+  assert.match(packageMatrix[0], /runs-on: windows-latest/);
   assert.match(packageMatrix[0], /Restore Electron download cache/);
   assert.match(packageMatrix[0], /actions\/cache@v6/);
   assert.match(packageMatrix[0], /node electron\/bridges\/terminalBridge\.moshConpty\.integration\.cjs/);
@@ -183,84 +180,24 @@ test("package downloads use bounded retries and reusable caches", () => {
   assert.equal(
     (buildWorkflow.match(/restore-keys:\s*\|\s*\n\s*electron-\$\{\{ runner\.os \}\}-\$\{\{ runner\.arch \}\}-/g) ?? [])
       .length,
-    3,
-    "all package jobs must reuse compatible Electron downloads after lockfile changes",
+    1,
+    "the Windows job must reuse compatible Electron downloads after lockfile changes",
   );
 
-  const linuxX64 = buildWorkflow.match(/\n  build-linux-x64:\n[\s\S]*?(?=\n  build-linux-arm64:)/)?.[0];
-  const linuxArm64 = buildWorkflow.match(/\n  build-linux-arm64:\n[\s\S]*?(?=\n  release:)/)?.[0];
-  assert.ok(linuxX64, "Linux x64 package job must be readable");
-  assert.ok(linuxArm64, "Linux arm64 package job must be readable");
-  assert.match(linuxX64, /image: quay\.io\/almalinuxorg\/almalinux:8/);
-  assert.match(linuxX64, /dnf -y --setopt=retries=4 --setopt=timeout=30 install/);
-  assert.match(
-    linuxX64,
-    /curl -fsSL --retry 4 --retry-connrefused --connect-timeout 20 --max-time 300/g,
-  );
-  assert.match(linuxArm64, /apt-get -o Acquire::Retries=4 update/);
-  assert.match(
-    linuxArm64,
-    /name: Install build dependencies\s*\n\s*shell: bash\s*\n\s*run: \|\s*\n\s*set -euo pipefail/,
-  );
-  assert.match(linuxArm64, /apt-get -o Acquire::Retries=4 install -y/);
-  assert.match(
-    linuxArm64,
-    /curl -fsSL --retry 4 --retry-all-errors --connect-timeout 20 --max-time 300/,
-  );
 });
 
-test("stable releases propose Nix metadata through a pull request", () => {
-  const nixJob = buildWorkflow.match(/\n  update-nix-release:\n[\s\S]*?(?=\n  homebrew-tap:)/);
-  assert.ok(nixJob, "update-nix-release job must exist before homebrew-tap");
-  assert.doesNotMatch(nixJob[0], /git push origin HEAD:\$\{\{ github\.event\.repository\.default_branch \}\}/);
-  assert.match(nixJob[0], /gh pr create/);
-  assert.ok(
-    nixJob[0].includes("GH_TOKEN: ${{ secrets.TRIAGE_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}"),
-    "Nix PR creation must prefer the triage-capable token and safely fall back to the job token",
-  );
-  assert.ok(
-    nixJob[0].includes("token: ${{ secrets.RELEASE_TOKEN }}"),
-    "Nix branch pushes must keep using the release token",
-  );
-  assert.match(nixJob[0], /automation\/nix-release-/);
-  assert.match(nixJob[0], /candidate_tree/);
-  assert.match(nixJob[0], /remote_tree/);
-  assert.match(nixJob[0], /branch_prefix/);
-  assert.match(nixJob[0], /headRefName/);
-  assert.match(nixJob[0], /headRepositoryOwner\.login == \$owner/);
-  assert.match(nixJob[0], /desired_nix_blob="\$\(git hash-object -w nix\/release\.nix\)"/);
-  assert.match(nixJob[0], /existing_branch/);
-  assert.match(nixJob[0], /refs\/heads\/\$\{existing_branch\}/);
-  assert.match(nixJob[0], /git cat-file blob "\$desired_nix_blob" > nix\/release\.nix/);
-  assert.match(nixJob[0], /git diff --quiet -- nix\/release\.nix/);
-  assert.match(nixJob[0], /while IFS='\|' read -r existing existing_branch/);
-  assert.match(nixJob[0], /done <<<"\$existing_prs"/);
-  assert.doesNotMatch(nixJob[0], /\.\[0\] \/\//);
-  assert.match(
-    nixJob[0],
-    /--force-with-lease="refs\/heads\/\$\{existing_branch\}:\$\{remote_before\}"/,
-  );
-  assert.match(nixJob[0], /origin "HEAD:\$\{existing_branch\}"/);
-  assert.match(nixJob[0], /gh api --method GET "repos\/\$\{GITHUB_REPOSITORY\}\/pulls"/);
-  assert.match(nixJob[0], /-f head="\$\{REPO_OWNER\}:\$\{branch\}"/);
-  assert.doesNotMatch(nixJob[0], /gh pr list[^\n]*--head "\$\{REPO_OWNER\}:/);
-  assert.match(nixJob[0], /\.headRefName == \$prefix/);
-  assert.doesNotMatch(
-    nixJob[0],
-    /\.headRefName \| startswith\(\$prefix\)/,
-    "v1.2.30 must not be treated as a v1.2.3 metadata branch",
-  );
-  assert.match(nixJob[0], /test\("\^\[0-9\]\+-\[0-9\]\+\$"\)/);
-  assert.match(nixJob[0], /suffix=.*branch_prefix/);
-  assert.match(nixJob[0], /\[\[ "\$suffix" =~ \^\[0-9\]\+-\[0-9\]\+\$ \]\]/);
-  assert.match(nixJob[0], /ls-remote --heads origin "refs\/heads\/\$\{branch_prefix\}\*"/);
-  assert.match(nixJob[0], /GITHUB_RUN_ID/);
-  assert.match(nixJob[0], /--force-with-lease="refs\/heads\/\$\{branch\}:"/);
-  assert.doesNotMatch(nixJob[0], /--force-with-lease="\$\{branch\}:\$\{expected\}"/);
-  assert.ok(
-    nixJob[0].indexOf('gh pr list') < nixJob[0].indexOf('git switch -C'),
-    "an existing Nix PR must be reused before rebuilding its branch",
-  );
+test("Windows releases only publish to this repository", () => {
+  const releaseJob = buildWorkflow.slice(buildWorkflow.indexOf("\n  release:\n"));
+  assert.match(releaseJob, /needs: build/);
+  assert.match(releaseJob, /if: needs\.build\.outputs\.publish == 'true'/);
+  assert.ok(releaseJob.includes("repository: ${{ github.repository }}"));
+  assert.ok(releaseJob.includes("token: ${{ github.token }}"));
+  assert.ok(releaseJob.includes("target_commitish: ${{ github.sha }}"));
+  assert.ok(buildWorkflow.includes('"$GITHUB_REPOSITORY" != C3nHx/Netcatty'));
+  assert.match(buildWorkflow, /permissions:\s*\n  contents: read/);
+  assert.match(releaseJob, /permissions:\s*\n      contents: write/);
+  assert.doesNotMatch(buildWorkflow, /RELEASE_TOKEN|HOMEBREW_TAP_TOKEN|TRIAGE_GITHUB_TOKEN/);
+  assert.doesNotMatch(buildWorkflow, /homebrew-tap:|update-nix-release:|npm publish|bump-homebrew-cask/);
 });
 
 test("Homebrew tap updates retry push races without downgrading newer releases", () => {

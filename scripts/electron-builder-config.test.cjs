@@ -386,3 +386,13 @@ test("linux FPM packages use the custom post-install template", () => {
     );
   }
 });
+
+
+test("publish and update metadata point only to this fork", () => {
+  assert.deepEqual(config.publish, [{
+    provider: "github",
+    owner: "C3nHx",
+    repo: "Netcatty",
+    releaseType: "release",
+  }]);
+});

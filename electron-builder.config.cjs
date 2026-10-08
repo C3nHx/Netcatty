@@ -323,7 +323,7 @@ module.exports = {
     publish: [
         {
             provider: 'github',
-            owner: 'binaricat',
+            owner: 'C3nHx',
             repo: 'Netcatty',
             releaseType: 'release'
         }
