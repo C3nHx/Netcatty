@@ -25,120 +25,44 @@ test("build workflow no longer installs removed legacy agent binaries", () => {
   }
 });
 
-test("build workflow uploads and releases Arch pacman artifacts", () => {
-  const releaseUploadPatterns = buildWorkflow.match(/release\/\*\.pacman/g) ?? [];
-  assert.equal(
-    releaseUploadPatterns.length,
-    3,
-    "mac/windows aggregate upload plus both Linux jobs must include release/*.pacman",
-  );
-  assert.ok(
-    buildWorkflow.includes("artifacts/*.pacman"),
-    "GitHub release file list must include downloaded pacman artifacts",
-  );
+test("package workflow builds only Windows and retains native/runtime checks", () => {
+  const jobs = [...buildWorkflow.matchAll(/^  ([\w-]+):\n    name:/gm)].map((match) => match[1]);
+  assert.deepEqual(jobs, ["build", "release"]);
+  assert.match(buildWorkflow, /name: build-windows\s*\n\s*runs-on: windows-latest/);
+  assert.doesNotMatch(buildWorkflow, /matrix:|macos-latest|build-linux|pack:mac|pack:linux/);
+  assert.match(buildWorkflow, /run: npm run pack:win-x64/);
+  assert.match(buildWorkflow, /Compile ConPTY test helpers/);
+  assert.match(buildWorkflow, /Test Mosh handshake through ConPTY/);
+  assert.match(buildWorkflow, /Verify packaged ConPTY threshold/);
+  assert.match(buildWorkflow, /Test tray panel layout at 200% scale on Windows/);
 });
 
-test("build workflow installs bsdtar for Arch pacman packaging", () => {
-  // arm64 (Debian) uses libarchive-tools; x64 (AlmaLinux 8) uses libarchive.
-  // Both packages provide bsdtar for electron-builder pacman metadata.
-  assert.match(
-    buildWorkflow,
-    /build-linux-arm64:[\s\S]*libarchive-tools/,
-    "Linux arm64 package job must install libarchive-tools for pacman metadata generation",
-  );
-  assert.match(
-    buildWorkflow,
-    /build-linux-x64:[\s\S]*\blibarchive\b/,
-    "Linux x64 package job must install libarchive (bsdtar) for pacman metadata generation",
-  );
-  // Pin a filename that actually exists on archive.debian.org so CI does not
-  // 404 when AlmaLinux's libarchive RPM ships without /usr/bin/bsdtar.
-  assert.match(
-    buildWorkflow,
-    /libarchive-tools_3\.3\.3-4\+deb10u1_amd64\.deb/,
-    "Linux x64 job must download a published Buster libarchive-tools deb for bsdtar",
-  );
+test("Windows artifacts and Release uploads contain only Windows packages", () => {
+  for (const extension of ["exe", "zip", "yml", "blockmap"]) {
+    assert.ok(buildWorkflow.includes(`release/*.${extension}`));
+    assert.ok(buildWorkflow.includes(`artifacts/*.${extension}`));
+  }
+  assert.match(buildWorkflow, /if-no-files-found: error/);
+  assert.match(buildWorkflow, /fail_on_unmatched_files: true/);
+  assert.match(buildWorkflow, /artifacts\/SHA256SUMS/);
+  assert.doesNotMatch(buildWorkflow, /\*\.(?:dmg|deb|rpm|pacman|AppImage)/);
+  assert.match(buildWorkflow, /ELECTRON_BUILDER_PUBLISH: "never"/);
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
+  assert.match(pkg.scripts["pack:win-x64"], /--publish=never/);
 });
 
 test("build workflow initializes MSVC before Windows packaging", () => {
-  const msvcStep = /name:\s*Set up MSVC developer command prompt[\s\S]*?if:\s*matrix\.name == 'windows'[\s\S]*?uses:\s*ilammy\/msvc-dev-cmd@v1[\s\S]*?arch:\s*x64/;
-  assert.match(
-    buildWorkflow,
-    msvcStep,
-    "Windows package builds must initialize the MSVC developer prompt so cl.exe is available for the Windows Hello helper",
-  );
+  assert.match(buildWorkflow, /name: Set up MSVC developer command prompt\s*\n\s*uses: ilammy\/msvc-dev-cmd@v1\s*\n\s*with:\s*\n\s*arch: x64/);
+  assert.ok(buildWorkflow.indexOf("Set up MSVC developer command prompt") < buildWorkflow.indexOf("name: Install deps"));
 });
 
-test("build workflow verifies RPM artifacts for both Linux architectures", () => {
-  assert.ok(
-    buildWorkflow.includes("bash scripts/verify-linux-rpm-artifact.sh x86_64"),
-    "Linux x64 package job must verify the RPM artifact",
-  );
-  assert.ok(
-    buildWorkflow.includes("bash scripts/verify-linux-rpm-artifact.sh aarch64"),
-    "Linux arm64 package job must verify the RPM artifact",
-  );
-});
-
-test("build workflow builds Linux x64 native modules in a glibc 2.28 container", () => {
-  // Keep x64 packages loadable on RHEL 8 / UOS / Deepin (see #2062).
-  // AlmaLinux 8 (glibc 2.28) replaces debian:buster so we still target the
-  // same glibc floor, but gcc-toolset-13 can compile Electron 42's -std=gnu++20
-  // (Buster's g++ 8 cannot).
-  const x64Job = buildWorkflow.match(
-    /build-linux-x64:[\s\S]*?(?=\n  build-linux-arm64:)/,
-  );
-  assert.ok(x64Job, "build-linux-x64 job must be present before build-linux-arm64");
-  assert.match(
-    x64Job[0],
-    /container:[\s\S]*?image:\s*quay\.io\/almalinuxorg\/almalinux:8/,
-    "Linux x64 package job must build inside the official AlmaLinux 8 image for glibc 2.28 + modern GCC",
-  );
-  assert.equal(
-    x64Job[0].includes("debian:buster"),
-    false,
-    "Linux x64 package job must not use debian:buster (g++ 8 cannot build gnu++20 natives)",
-  );
-  assert.equal(
-    x64Job[0].includes("ubuntu-22.04"),
-    false,
-    "Linux x64 package job must not build on the host ubuntu-22.04 glibc",
-  );
-  assert.equal(
-    x64Job[0].includes("actions/setup-node@"),
-    false,
-    "Linux x64 package job must install Node inside the container like arm64",
-  );
-  assert.match(
-    x64Job[0],
-    /gcc-toolset-13-gcc-c\+\+/,
-    "Linux x64 job must install gcc-toolset-13 for C++20 native rebuilds",
-  );
-  assert.match(
-    x64Job[0],
-    /static-libstdc\+\+/,
-    "Linux x64 job must static-link libstdc++ so RHEL 8 stock libstdc++ is enough",
-  );
-  assert.match(
-    x64Job[0],
-    /unset LD_LIBRARY_PATH/,
-    "Linux x64 job must wrap packaging tools to clear portable-fpm LD_LIBRARY_PATH",
-  );
-  assert.match(
-    x64Job[0],
-    /for cmd in rpmbuild bsdtar/,
-    "Linux x64 job must wrap both rpmbuild and bsdtar for rpm/pacman targets",
-  );
-  assert.match(
-    x64Job[0],
-    /python3\.11/,
-    "Linux x64 job must use Python >=3.8 for node-gyp 12",
-  );
-  assert.equal(
-    x64Job[0].includes("actions/setup-python@"),
-    false,
-    "Linux x64 job must not rely on actions/setup-python inside the glibc container",
-  );
+test("Windows release downloads terminal clients without publishing upstream", () => {
+  const bundle = buildWorkflow.match(/- name: Bundle Windows terminal clients[\s\S]*?(?=\n      - name: Build package)/)?.[0];
+  assert.ok(bundle);
+  assert.match(bundle, /ET_BIN_OWNER: binaricat/);
+  assert.match(bundle, /ET_BIN_REPO: Netcatty-et-bin/);
+  assert.match(bundle, /MOSH_BIN_OWNER: binaricat/);
+  assert.match(bundle, /--platform=win32 --arch=x64 --resolve-release/g);
 });
 
 test("et binary build scripts retry dependency configure and pin ninja", () => {
