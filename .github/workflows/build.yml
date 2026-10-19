@@ -1,7 +1,7 @@
 name: build-packages
 
 # Build Windows x64 only. PRs and manual checks upload Actions artifacts;
-# version tags and explicitly requested manual releases publish to this fork.
+# fork release branches, version tags, and requested manual releases publish here.
 on:
   workflow_dispatch:
     inputs:
@@ -10,13 +10,14 @@ on:
         type: boolean
         default: false
       release_tag:
-        description: "Version tag for a manual release from a branch (e.g. v1.1.84)"
+        description: "Optional configured fork tag (e.g. v1.1.85-c3nhx.1)"
         type: string
         default: ""
   push:
+    branches:
+      - "release/windows-v*"
     tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"
-      - "v[0-9]+.[0-9]+.[0-9]+-[0-9A-Za-z]*"
+      - "v[0-9]+.[0-9]+.[0-9]+-c3nhx.[0-9]*"
   pull_request:
     paths:
       - ".github/workflows/build.yml"
@@ -26,6 +27,8 @@ on:
       - "index.css"
       - "build/**"
       - "electron-builder.config.cjs"
+      - "fork-release.json"
+      - "domain/forkRelease.mjs"
       - "electron/**"
       - "!electron/**/*.test.*"
       - "!electron/**/*.spec.*"
@@ -55,6 +58,7 @@ on:
       - "scripts/linux/**"
       - "scripts/mosh-extra-resources.cjs"
       - "scripts/nodePtyConptyPatch.cjs"
+      - "scripts/set-fork-version.cjs"
       - "scripts/patch-xterm-macos-column-selection.cjs"
       - "scripts/patch-xterm-foreground-intense.cjs"
       - "scripts/patch-xterm-webgl-atlas.cjs"
@@ -68,7 +72,7 @@ on:
 
 concurrency:
   group: build-packages-${{ github.ref_type == 'tag' && format('release-{0}', github.ref_name) || inputs.publish_release && format('release-{0}', inputs.release_tag) || github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || github.ref }}
-  cancel-in-progress: ${{ github.ref_type != 'tag' && !inputs.publish_release }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' && !startsWith(github.ref_name, 'release/windows-v') && !inputs.publish_release }}
 
 permissions:
   contents: read
@@ -78,7 +82,6 @@ env:
   NPM_CONFIG_FETCH_RETRY_FACTOR: "2"
   NPM_CONFIG_FETCH_RETRY_MINTIMEOUT: "1000"
   NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT: "10000"
-  STRICT_VERSION_REF_RE: '^refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[A-Za-z][0-9A-Za-z-]*|[0-9A-Za-z][0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[A-Za-z][0-9A-Za-z-]*|[0-9A-Za-z][0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?$'
 
 jobs:
   build:
@@ -89,6 +92,9 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       version: ${{ steps.version.outputs.version }}
       publish: ${{ steps.version.outputs.publish }}
+      upstream_version: ${{ steps.version.outputs.upstream_version }}
+      upstream_commit: ${{ steps.version.outputs.upstream_commit }}
+      patch: ${{ steps.version.outputs.patch }}
     env:
       VITE_SYNC_GITHUB_CLIENT_ID: ${{ secrets.VITE_SYNC_GITHUB_CLIENT_ID }}
       VITE_SYNC_GOOGLE_CLIENT_ID: ${{ secrets.VITE_SYNC_GOOGLE_CLIENT_ID }}
@@ -99,6 +105,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Setup Node
         uses: actions/setup-node@v7
@@ -112,43 +119,26 @@ jobs:
         env:
           PUBLISH_RELEASE: ${{ inputs.publish_release }}
           RELEASE_TAG: ${{ inputs.release_tag }}
+        run: node scripts/set-fork-version.cjs
+
+      - name: Verify official baseline and release tag
+        if: steps.version.outputs.publish == 'true'
+        shell: bash
+        env:
+          UPSTREAM_VERSION: ${{ steps.version.outputs.upstream_version }}
+          UPSTREAM_COMMIT: ${{ steps.version.outputs.upstream_commit }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
         run: |
-          tag=""
-          publish=false
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            tag="${GITHUB_REF#refs/tags/}"
-            if [[ "$GITHUB_EVENT_NAME" == push || "$PUBLISH_RELEASE" == true ]]; then
-              publish=true
-            fi
-          elif [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$PUBLISH_RELEASE" == true ]]; then
-            tag="$RELEASE_TAG"
-            publish=true
+          set -euo pipefail
+          git fetch --no-tags https://github.com/binaricat/Netcatty.git "refs/tags/v$UPSTREAM_VERSION"
+          actual="$(git rev-parse 'FETCH_HEAD^{commit}')"
+          test "$actual" = "$UPSTREAM_COMMIT" || { echo "::error::Official tag does not match fork-release.json"; exit 1; }
+          git merge-base --is-ancestor "$actual" HEAD || { echo "::error::Release source does not contain the official version"; exit 1; }
+          existing="$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}" | sort -k2r | head -n 1 | cut -f1)"
+          if [[ -n "$existing" && "$existing" != "$GITHUB_SHA" ]]; then
+            echo "::error::Release tag $RELEASE_TAG already points at another commit."
+            exit 1
           fi
-          if [[ -n "$tag" || "$publish" == true ]]; then
-            if [[ ! "refs/tags/$tag" =~ $STRICT_VERSION_REF_RE ]]; then
-              echo "::error::A release requires a strict v<MAJOR>.<MINOR>.<PATCH>[-prerelease] tag."
-              exit 1
-            fi
-            version="${tag#v}"
-          else
-            version="0.0.0-sha-${GITHUB_SHA:0:7}"
-          fi
-          if [[ "$publish" == true ]]; then
-            if [[ "$GITHUB_REPOSITORY" != C3nHx/Netcatty ]]; then
-              echo "::error::Release publishing is restricted to C3nHx/Netcatty."
-              exit 1
-            fi
-            # Never attach packages to a tag that points at different source.
-            existing="$(git ls-remote --tags origin "refs/tags/$tag" "refs/tags/$tag^{}" | sort -k2r | head -n 1 | cut -f1)"
-            if [[ -n "$existing" && "$existing" != "$GITHUB_SHA" ]]; then
-              echo "::error::Release tag $tag already points at another commit."
-              exit 1
-            fi
-          fi
-          npm pkg set version="$version"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "publish=$publish" >> "$GITHUB_OUTPUT"
 
       - name: Set up MSVC developer command prompt
         uses: ilammy/msvc-dev-cmd@v1
@@ -241,6 +231,9 @@ jobs:
     if: needs.build.outputs.publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    concurrency:
+      group: fork-release-${{ needs.build.outputs.tag }}
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -268,11 +261,16 @@ jobs:
           token: ${{ github.token }}
           tag_name: ${{ needs.build.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          name: Netcatty ${{ needs.build.outputs.tag }} (Windows)
+          name: Netcatty ${{ needs.build.outputs.tag }} (C3nHx Windows x64)
           draft: false
-          prerelease: ${{ contains(needs.build.outputs.tag, '-') }}
+          prerelease: true
           body: |
             Windows x64 build of C3nHx/Netcatty.
+
+            Official baseline: binaricat/Netcatty v${{ needs.build.outputs.upstream_version }}
+            Official commit: ${{ needs.build.outputs.upstream_commit }}
+            C3nHx patch: ${{ needs.build.outputs.patch }}
+            Update channel: c3nhx
 
             - Includes the node-pty ConPTY selection threshold patch: Windows build 17763 and later.
             - Includes the installer, portable executable, ZIP archive, and SHA256SUMS.

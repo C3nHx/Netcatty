@@ -393,6 +393,7 @@ test("publish and update metadata point only to this fork", () => {
     provider: "github",
     owner: "C3nHx",
     repo: "Netcatty",
+    channel: "c3nhx",
     releaseType: "release",
   }]);
 });

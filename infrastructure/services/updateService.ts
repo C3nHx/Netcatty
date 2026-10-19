@@ -7,13 +7,13 @@
  */
 
 import { netcattyBridge } from "./netcattyBridge";
+import { compareVersions, selectForkRelease, GITHUB_RELEASES_API, RELEASES_PAGE_URL } from '../../domain/forkRelease.mjs';
+
+export { compareVersions };
 
 // ================================
 // Part 1: GitHub API Version Check
 // ================================
-
-const GITHUB_API_URL = 'https://api.github.com/repos/binaricat/Netcatty/releases/latest';
-const RELEASES_PAGE_URL = 'https://github.com/binaricat/Netcatty/releases';
 
 export interface ReleaseInfo {
   version: string;       // e.g. "1.0.0" (without 'v' prefix)
@@ -39,43 +39,12 @@ export interface UpdateCheckResult {
 }
 
 /**
- * Parse version string to comparable array
- * e.g. "1.2.3" -> [1, 2, 3]
- */
-function parseVersion(version: string): number[] {
-  // Remove 'v' prefix if present
-  const clean = version.replace(/^v/i, '');
-  return clean.split('.').map((part) => {
-    const num = parseInt(part, 10);
-    return isNaN(num) ? 0 : num;
-  });
-}
-
-/**
- * Compare two version strings
- * Returns: 1 if a > b, -1 if a < b, 0 if equal
- */
-export function compareVersions(a: string, b: string): number {
-  const partsA = parseVersion(a);
-  const partsB = parseVersion(b);
-  const maxLen = Math.max(partsA.length, partsB.length);
-
-  for (let i = 0; i < maxLen; i++) {
-    const numA = partsA[i] ?? 0;
-    const numB = partsB[i] ?? 0;
-    if (numA > numB) return 1;
-    if (numA < numB) return -1;
-  }
-  return 0;
-}
-
-/**
  * Check for updates via GitHub API (compares version strings).
  * Used by useUpdateCheck for the notification banner.
  */
 export async function checkForUpdates(currentVersion: string): Promise<UpdateCheckResult> {
   try {
-    const response = await fetch(GITHUB_API_URL, {
+    const response = await fetch(GITHUB_RELEASES_API, {
       headers: { Accept: 'application/vnd.github.v3+json' },
     });
 
@@ -83,7 +52,9 @@ export async function checkForUpdates(currentVersion: string): Promise<UpdateChe
       throw new Error(`GitHub API returned ${response.status}`);
     }
 
-    const data = await response.json();
+    const releases = await response.json();
+    const data = selectForkRelease(releases);
+    if (!data) return { hasUpdate: false, currentVersion, latestRelease: null };
     const latestVersion = (data.tag_name as string).replace(/^v/i, '');
 
     const latestRelease: ReleaseInfo = {

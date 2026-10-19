@@ -93,9 +93,9 @@ test("manual package validations do not share push concurrency", () => {
   );
 });
 
-test("package validation uses explicit releases and scopes PR builds", () => {
-  assert.match(buildWorkflow, /push:\s*\n\s*tags:/);
-  assert.doesNotMatch(buildWorkflow, /push:\s*\n\s*branches:/);
+test("package validation uses explicit fork release branches and scopes PR builds", () => {
+  assert.match(buildWorkflow, /push:\s*\n\s*branches:\s*\n\s*- "release\/windows-v\*"\s*\n\s*tags:/);
+  assert.doesNotMatch(buildWorkflow, /branches:\s*\n\s*- main/);
   assert.doesNotMatch(buildWorkflow, /branches:\s*\n\s*- "\*\*"/);
   assert.match(buildWorkflow, /pull_request:\s*\n\s*paths:/);
   assert.doesNotMatch(buildWorkflow, /\n  dedupe:/);
@@ -187,7 +187,8 @@ test("Windows releases only publish to this repository", () => {
   assert.ok(releaseJob.includes("repository: ${{ github.repository }}"));
   assert.ok(releaseJob.includes("token: ${{ github.token }}"));
   assert.ok(releaseJob.includes("target_commitish: ${{ github.sha }}"));
-  assert.ok(buildWorkflow.includes('"$GITHUB_REPOSITORY" != C3nHx/Netcatty'));
+  const versionScript = fs.readFileSync(path.join(__dirname, "set-fork-version.cjs"), "utf8");
+  assert.ok(versionScript.includes('env.GITHUB_REPOSITORY !== "C3nHx/Netcatty"'));
   assert.match(buildWorkflow, /permissions:\s*\n  contents: read/);
   assert.match(releaseJob, /permissions:\s*\n      contents: write/);
   assert.doesNotMatch(buildWorkflow, /RELEASE_TOKEN|HOMEBREW_TAP_TOKEN|TRIAGE_GITHUB_TOKEN/);

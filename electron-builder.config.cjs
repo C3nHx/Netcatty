@@ -334,6 +334,7 @@ module.exports = {
             provider: 'github',
             owner: 'C3nHx',
             repo: 'Netcatty',
+            channel: 'c3nhx',
             releaseType: 'release'
         }
     ]
