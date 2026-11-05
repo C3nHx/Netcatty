@@ -14,12 +14,15 @@ import {
   STORAGE_KEY_AI_RESPONSE_IDLE_TIMEOUT,
   STORAGE_KEY_AI_MAX_ITERATIONS,
   STORAGE_KEY_AI_SESSIONS,
+  STORAGE_KEY_AI_SESSIONS_OVERFLOW,
+  STORAGE_KEY_AI_SESSIONS_DISK_OVERFLOW,
   STORAGE_KEY_AI_ACTIVE_SESSION_MAP,
   STORAGE_KEY_AI_AGENT_MODEL_MAP,
   STORAGE_KEY_AI_AGENT_PROVIDER_MAP,
   STORAGE_KEY_AI_AGENT_THINKING_MAP,
   STORAGE_KEY_AI_WEB_SEARCH,
   STORAGE_KEY_AI_QUICK_MESSAGES,
+  STORAGE_KEY_CLOUD_SYNC_AI_SESSIONS,
 } from '../../infrastructure/config/storageKeys';
 import type { AIQuickMessage } from '../../infrastructure/ai/quickMessages';
 import { sanitizeQuickMessages } from '../../infrastructure/ai/quickMessages';
@@ -63,12 +66,18 @@ import {
   bumpDraftUploadGeneration,
   cleanupDeletedAIChatSessions,
   cleanupOrphanedAISessions,
+  latestAIActiveTargetIdsSnapshot,
   getAIBridge,
+  flushBackupMirror,
   getDraftUploadGeneration,
   latestAIActiveSessionMapSnapshot,
   latestAIDraftsByScopeSnapshot,
   latestAIPanelViewByScopeSnapshot,
   latestAISessionsSnapshot,
+  prepareRestoredSessions,
+  readSessionsFromStorage,
+  scheduleBackupMirror,
+  rebindActiveSessionMap,
   writeSessionsForStorage,
   setLatestAIActiveSessionMapSnapshot,
   setLatestAIDraftsByScopeSnapshot,
@@ -77,6 +86,12 @@ import {
   type DraftsByScope,
   type PanelViewByScope,
 } from './aiStateSnapshots';
+import {
+  isMissingOrCorruptSessionsStore,
+  parseSessionsStore,
+  mergeImportedSessions,
+  parseBackupSessions,
+} from './aiSessionsBackup';
 import { AI_STATE_CHANGED_EVENT, emitAIStateChanged } from './aiStateEvents';
 import {
   persistCommandBlocklistSetting,
@@ -168,9 +183,82 @@ export function useAIState() {
   // ── Sessions ──
   const [sessions, setSessionsRaw] = useState<AISession[]>(() =>
     latestAISessionsSnapshot
-      ?? localStorageAdapter.read<AISession[]>(STORAGE_KEY_AI_SESSIONS)
-      ?? []
+      ?? readSessionsFromStorage()
   );
+  // An explicit empty array is authoritative, even if the backup is stale.
+  // Disk-only overflow IDs also permit recovery, without reviving deleted chats.
+  useEffect(() => {
+    window.addEventListener('beforeunload', flushBackupMirror);
+    return () => window.removeEventListener('beforeunload', flushBackupMirror);
+  }, []);
+  useEffect(() => {
+    const liveRaw = localStorageAdapter.readString(STORAGE_KEY_AI_SESSIONS);
+    const liveStore = parseSessionsStore(liveRaw);
+    const liveSessions = readSessionsFromStorage();
+    const diskOnlyRecovery = (localStorageAdapter.read<string[]>(STORAGE_KEY_AI_SESSIONS_DISK_OVERFLOW)?.length ?? 0) > 0;
+    if (!diskOnlyRecovery && (liveStore.valid || liveSessions.length > 0)) {
+      if (liveSessions.length > 0) scheduleBackupMirror(JSON.stringify(liveSessions));
+      return;
+    }
+    if (!diskOnlyRecovery && latestAISessionsSnapshot && latestAISessionsSnapshot.length > 0) return;
+    const bridge = getAIBridge();
+    if (!bridge?.aiSessionsBackupReadLatest) return;
+    let cancelled = false;
+    const canRestore = () => diskOnlyRecovery
+      ? (localStorageAdapter.read<string[]>(STORAGE_KEY_AI_SESSIONS_DISK_OVERFLOW)?.length ?? 0) > 0
+      : isMissingOrCorruptSessionsStore(localStorageAdapter.readString(STORAGE_KEY_AI_SESSIONS))
+        && readSessionsFromStorage().length === 0
+        && (latestAISessionsSnapshot?.length ?? 0) === 0
+        && sessionsRef.current.length === 0;
+    void (async () => {
+      try {
+        if (!canRestore()) return;
+        const backup = await bridge.aiSessionsBackupReadLatest?.();
+        if (cancelled || !backup?.ok) return;
+        // Re-check after the async gap so live mutations and deletions win.
+        if (!canRestore()) return;
+        const backupSessions = parseBackupSessions(backup.json);
+        if (!backupSessions) return;
+        const diskOnlyIds = new Set(localStorageAdapter.read<string[]>(STORAGE_KEY_AI_SESSIONS_DISK_OVERFLOW) ?? []);
+        const recovered = diskOnlyRecovery
+          ? mergeImportedSessions(
+            backupSessions.filter(session => diskOnlyIds.has(session.id)),
+            latestAISessionsSnapshot ?? readSessionsFromStorage(),
+          )
+          : backupSessions;
+        const syncEnabled = !!localStorageAdapter.read<{ enabled?: boolean }>(STORAGE_KEY_CLOUD_SYNC_AI_SESSIONS)?.enabled;
+        const restored = prepareRestoredSessions(recovered, syncEnabled);
+        if (restored.length === 0) return;
+        // Apply restore synchronously (not inside a setState updater). A
+        // deferred updater would leave didRestore false and skip dangling
+        // marking even when the records later land in React state.
+        setLatestAISessionsSnapshot(restored);
+        writeSessionsForStorage(restored);
+        emitAIStateChanged(STORAGE_KEY_AI_SESSIONS);
+        // Restore does not change live terminals/workspaces, so the orphan-
+        // cleanup effect will not run. Reuse the last known live target set
+        // (empty is valid: nothing live) so chats bound to missing scopes
+        // become dangling and /chats can offer /rebind.
+        cleanupOrphanedAISessions(latestAIActiveTargetIdsSnapshot);
+        const nextSessions = latestAISessionsSnapshot ?? restored;
+        sessionsRef.current = nextSessions;
+        setSessionsRaw(nextSessions);
+        setActiveSessionIdMapRaw(
+          latestAIActiveSessionMapSnapshot
+            ?? localStorageAdapter.read<Record<string, string | null>>(STORAGE_KEY_AI_ACTIVE_SESSION_MAP)
+            ?? {},
+        );
+        console.info(
+          `[AIState] Restored ${restored.length} AI session(s) from the disk backup.`,
+        );
+      } catch {
+        // Backup restore must never break startup.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   // Ref that always holds the latest sessions for use inside debounced callbacks
   const sessionsRef = useRef(sessions);
   useEffect(() => {
@@ -245,6 +333,11 @@ export function useAIState() {
 
   useEffect(() => {
     const validSessionIds = new Set<string>(sessions.map((session) => session.id));
+    // Disk-only chats may not have arrived from the startup backup read yet.
+    // Keep their active pointers and panel views until recovery or deletion.
+    for (const id of localStorageAdapter.read<string[]>(STORAGE_KEY_AI_SESSIONS_DISK_OVERFLOW) ?? []) {
+      validSessionIds.add(id);
+    }
     let changed = false;
     const nextActiveSessionIdMap: Record<string, string | null> = {};
 
@@ -464,7 +557,9 @@ export function useAIState() {
   useEffect(() => {
     const handleStorage = (e: StorageEvent) => {
       try {
-        switch (e.key) {
+        const key = e.key === STORAGE_KEY_AI_SESSIONS_OVERFLOW || e.key?.startsWith(`${STORAGE_KEY_AI_SESSIONS_OVERFLOW}_`)
+          ? STORAGE_KEY_AI_SESSIONS : e.key;
+        switch (key) {
           case STORAGE_KEY_AI_PROVIDERS: {
             const parsed = localStorageAdapter.read<ProviderConfig[]>(STORAGE_KEY_AI_PROVIDERS);
             if (parsed != null && !Array.isArray(parsed)) {
@@ -556,7 +651,7 @@ export function useAIState() {
             break;
           }
           case STORAGE_KEY_AI_SESSIONS: {
-            const nextSessions = localStorageAdapter.read<AISession[]>(STORAGE_KEY_AI_SESSIONS) ?? [];
+            const nextSessions = readSessionsFromStorage();
             setLatestAISessionsSnapshot(nextSessions);
             setSessionsRaw(nextSessions);
             break;
@@ -598,8 +693,7 @@ export function useAIState() {
         case STORAGE_KEY_AI_SESSIONS:
           setSessionsRaw(
             latestAISessionsSnapshot
-              ?? localStorageAdapter.read<AISession[]>(STORAGE_KEY_AI_SESSIONS)
-              ?? [],
+              ?? readSessionsFromStorage(),
           );
           return;
         case STORAGE_KEY_AI_ACTIVE_SESSION_MAP:
@@ -651,8 +745,8 @@ export function useAIState() {
   }, []);
 
   // ── Session CRUD ──
-  const persistSessions = useCallback((next: AISession[]) => {
-    writeSessionsForStorage(next);
+  const persistSessions = useCallback((next: AISession[], deletedSessionIds?: readonly string[]) => {
+    writeSessionsForStorage(next, { deletedSessionIds });
   }, []);
 
   // Debounced version of persistSessions for high-frequency updates (e.g. streaming)
@@ -797,7 +891,7 @@ export function useAIState() {
     setSessionsRaw(prev => {
       const next = prev.filter(s => s.id !== sessionId);
       setLatestAISessionsSnapshot(next);
-      persistSessions(next);
+      persistSessions(next, [sessionId]);
       return next;
     });
     if (scopeKey) {
@@ -841,7 +935,7 @@ export function useAIState() {
         return !(s.scope.type === scopeType && s.scope.targetId === targetId);
       });
       setLatestAISessionsSnapshot(next);
-      persistSessions(next);
+      persistSessions(next, removedSessionIds);
       return next;
     });
     const scopeKey = `${scopeType}:${targetId}`;
@@ -866,6 +960,102 @@ export function useAIState() {
     });
   }, [persistSessions]);
 
+  // Issue #4015 R2: rebind a dangling chat to the panel's current scope.
+  // Rewrites `scope`, clears the dangling marker and makes the chat the
+  // active session of its new scope so it shows in the scoped history again.
+  const rebindSessionScope = useCallback((
+    sessionId: string,
+    scope: { type: 'terminal' | 'workspace'; targetId: string; hostIds?: string[] },
+  ) => {
+    const scopeKey = `${scope.type}:${scope.targetId}`;
+    setSessionsRaw(prev => {
+      const next = prev.map(s => {
+        if (s.id !== sessionId) return s;
+        const { scopeDangling: _cleared, ...rest } = s;
+        // Replace scope entirely (including hostIds) so history matching follows
+        // the destination terminal/workspace rather than the chat's old host.
+        const nextScope: AISession['scope'] = {
+          type: scope.type,
+          targetId: scope.targetId,
+        };
+        if (scope.hostIds && scope.hostIds.length > 0) {
+          nextScope.hostIds = [...scope.hostIds];
+        }
+        return {
+          ...rest,
+          scope: nextScope,
+          updatedAt: Date.now(),
+        } as AISession;
+      });
+      setLatestAISessionsSnapshot(next);
+      persistSessions(next);
+      return next;
+    });
+    // Drop stale pointers that still reference this chat under its previous
+    // scope key, then restore the active pointer for the new scope.
+    // Compute + persist inside the updater so a deferred React setState still
+    // writes the cleaned map (outer capture would stay null and skip persist).
+    setActiveSessionIdMapRaw(prev => {
+      const next = rebindActiveSessionMap(prev, sessionId, scopeKey);
+      setLatestAIActiveSessionMapSnapshot(next);
+      localStorageAdapter.write(STORAGE_KEY_AI_ACTIVE_SESSION_MAP, next);
+      emitAIStateChanged(STORAGE_KEY_AI_ACTIVE_SESSION_MAP);
+      return next;
+    });
+    // Open the rebound chat in this panel; active-map alone loses to an
+    // explicit draft/session panelView that still points elsewhere.
+    setPanelViewByScope((prev) => setSessionView(prev, scopeKey, sessionId));
+  }, [persistSessions, setPanelViewByScope]);
+
+  // Manual durability escape hatch (issue #4015 follow-up): export the
+  // current store to a user-chosen JSON file, or import one back in.
+  // Import is an explicit action, so it may overwrite the live store.
+  const exportSessionsBackup = useCallback(async (): Promise<string | null> => {
+    const bridge = getAIBridge();
+    if (!bridge?.aiSessionsBackupExport) return null;
+    const result = await bridge.aiSessionsBackupExport({
+      json: JSON.stringify(sessionsRef.current),
+    });
+    return result?.success ? (result.filePath ?? '') : null;
+  }, []);
+
+  const importSessionsBackup = useCallback(async (): Promise<number> => {
+    const bridge = getAIBridge();
+    if (!bridge?.aiSessionsBackupImport) return 0;
+    const result = await bridge.aiSessionsBackupImport();
+    if (!result?.success || !result.json) return 0;
+    const imported = parseBackupSessions(result.json);
+    if (!imported || imported.length === 0) return 0;
+    // Merge synchronously against the live ref so orphan cleanup sees the
+    // imported chats even if React would defer a setState updater.
+    const syncEnabled = !!localStorageAdapter.read<{ enabled?: boolean }>(STORAGE_KEY_CLOUD_SYNC_AI_SESSIONS)?.enabled;
+    const next = prepareRestoredSessions(mergeImportedSessions(sessionsRef.current, imported), syncEnabled);
+    if (!writeSessionsForStorage(next)) return 0;
+    // Local readback can omit disk-only overflow chats. Keep the complete
+    // prepared history live so cleanup and later writes retain those chats.
+    const importedIds = new Set(imported.map(session => session.id));
+    sessionsRef.current = next;
+    setLatestAISessionsSnapshot(next);
+    setSessionsRaw(next);
+    emitAIStateChanged(STORAGE_KEY_AI_SESSIONS);
+    // Import does not change live terminals/workspaces, so the orphan-cleanup
+    // effect will not run. Reuse the last known live target set (empty is
+    // valid: nothing live) to mark chats bound to missing scopes as dangling
+    // so /chats can offer /rebind.
+    cleanupOrphanedAISessions(latestAIActiveTargetIdsSnapshot);
+    const nextSessions =
+      latestAISessionsSnapshot
+      ?? next;
+    sessionsRef.current = nextSessions;
+    setSessionsRaw(nextSessions);
+    setActiveSessionIdMapRaw(
+      latestAIActiveSessionMapSnapshot
+        ?? localStorageAdapter.read<Record<string, string | null>>(STORAGE_KEY_AI_ACTIVE_SESSION_MAP)
+        ?? {},
+    );
+    return nextSessions.filter(session => importedIds.has(session.id)).length;
+  }, []);
+
   const updateSessionExternalSessionId = useCallback((sessionId: string, externalSessionId: string | undefined) => {
     setSessionsRaw(prev => {
       const next = prev.map(s => (
@@ -879,16 +1069,17 @@ export function useAIState() {
     });
   }, [debouncedPersistSessions]);
 
-  // Maximum messages per session to prevent unbounded memory growth
+  // Local-only retention. Synced history must match the full-history storage policy.
   const MAX_MESSAGES_PER_SESSION = 500;
 
   const addMessageToSession = useCallback((sessionId: string, message: ChatMessage) => {
+    const syncEnabled = localStorageAdapter.read<{ enabled?: boolean }>(STORAGE_KEY_CLOUD_SYNC_AI_SESSIONS)?.enabled === true;
     setSessionsRaw(prev => {
       const next = prev.map(s => {
         if (s.id !== sessionId) return s;
         let msgs = [...s.messages, message];
-        // Trim oldest messages if exceeding limit (keep system messages)
-        if (msgs.length > MAX_MESSAGES_PER_SESSION) {
+        // Dropping synced prefixes makes the next cloud merge add them back.
+        if (!syncEnabled && msgs.length > MAX_MESSAGES_PER_SESSION) {
           const systemMsgs = msgs.filter(m => m.role === 'system');
           const nonSystemMsgs = msgs.filter(m => m.role !== 'system');
           const dropped = nonSystemMsgs.length - (MAX_MESSAGES_PER_SESSION - systemMsgs.length);
@@ -1134,8 +1325,7 @@ export function useAIState() {
 
     const nextSessions =
       latestAISessionsSnapshot
-      ?? localStorageAdapter.read<AISession[]>(STORAGE_KEY_AI_SESSIONS)
-      ?? [];
+      ?? readSessionsFromStorage();
     sessionsRef.current = nextSessions;
     setSessionsRaw(nextSessions);
     setActiveSessionIdMapRaw(
@@ -1187,8 +1377,7 @@ export function useAIState() {
       ?? {};
     const currentSessions =
       latestAISessionsSnapshot
-      ?? localStorageAdapter.read<AISession[]>(STORAGE_KEY_AI_SESSIONS)
-      ?? [];
+      ?? readSessionsFromStorage();
     const currentPanelViewByScope = latestAIPanelViewByScopeSnapshot ?? {};
     const result = handoffDissolvedWorkspaceAIScope({
       activeSessionIdMap: currentMap,
@@ -1233,8 +1422,7 @@ export function useAIState() {
       ?? {};
     const currentSessions =
       latestAISessionsSnapshot
-      ?? localStorageAdapter.read<AISession[]>(STORAGE_KEY_AI_SESSIONS)
-      ?? [];
+      ?? readSessionsFromStorage();
     const result = retargetWorkspaceActiveChatAfterMemberLoss({
       activeSessionIdMap: currentMap,
       sessions: currentSessions,
@@ -1370,6 +1558,9 @@ export function useAIState() {
     deleteSession,
     deleteSessionsByTarget,
     updateSessionTitle,
+    rebindSessionScope,
+    exportSessionsBackup,
+    importSessionsBackup,
     updateSessionExternalSessionId,
     addMessageToSession,
     updateLastMessage,
@@ -1432,6 +1623,9 @@ export function useAIState() {
     deleteSession,
     deleteSessionsByTarget,
     updateSessionTitle,
+    rebindSessionScope,
+    exportSessionsBackup,
+    importSessionsBackup,
     updateSessionExternalSessionId,
     addMessageToSession,
     updateLastMessage,

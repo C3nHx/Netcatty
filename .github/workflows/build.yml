@@ -66,6 +66,9 @@ on:
       - "scripts/resolve-et-bin-release.cjs"
       - "scripts/resolve-mosh-bin-release.cjs"
       - "scripts/tray-panel-layout.live.test.cjs"
+      - "scripts/serial-named-pipe.live.test.cjs"
+      - "scripts/fixtures/serial/**"
+      - "scripts/test-packaged-ssh-ciphers.cjs"
       - "scripts/verify-linux-*.sh"
       - "scripts/xterm-macos-column-selection.live.test.cjs"
       - "skills/**"
@@ -158,6 +161,9 @@ jobs:
       - name: Install deps
         run: npm ci
 
+      - name: Test Windows serial pipe through native Electron
+        run: npx electron scripts/serial-named-pipe.live.test.cjs
+
       - name: Compile ConPTY test helpers
         shell: pwsh
         run: |
@@ -205,6 +211,9 @@ jobs:
           if ($agent -notmatch '_getWindowsBuildNumber\(\)\s*>=\s*17763') {
             throw "Packaged node-pty is missing the ConPTY build 17763 patch"
           }
+
+      - name: Test packaged SSH cipher negotiation
+        run: node scripts/test-packaged-ssh-ciphers.cjs
 
       - name: Test tray panel layout
         run: npm run test:tray-panel-layout

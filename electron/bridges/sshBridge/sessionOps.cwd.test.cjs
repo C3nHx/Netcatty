@@ -38,6 +38,31 @@ function makeApi(session, siblingSessions = [], overrides = {}) {
   });
 }
 
+test("getSessionPwd reads a local PTY cwd without an SSH connection", { skip: process.platform !== "linux" }, async () => {
+  const api = makeApi({
+    protocol: "local",
+    type: "local",
+    proc: { pid: process.pid },
+  });
+
+  const result = await api.getSessionPwd(null, {
+    sessionId: "session-1",
+    allowHomeFallback: false,
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.cwd, fs.realpathSync(process.cwd()));
+});
+
+test("getSessionPwd does not require an SSH connection for a local session", async () => {
+  const api = makeApi({ protocol: "local", type: "local" });
+
+  const result = await api.getSessionPwd(null, { sessionId: "session-1" });
+
+  assert.equal(result.success, false);
+  assert.equal(result.error, "Local session has no process");
+});
+
 test("shared terminal cwd probe refuses to guess without a shell pid", async () => {
   let execCalls = 0;
   const connRef = { count: 2 };
@@ -308,6 +333,9 @@ test("cwd probe forces POSIX sh, captures sshd PPID, and keeps the watchdog", as
   assert.ok(command.includes(") </dev/null >/dev/null 2>&1 & nc_watchdog_pid=$!"));
   assert.ok(command.includes('kill -9 $nc_kids "$nc_watchdog_pid"'));
   assert.ok(command.includes('find_login_shell "${NC_SSHD_PPID:-$PPID}"'));
+  assert.match(command, /ps -e -o pid= -o ppid= -o tty= -o comm=/);
+  assert.match(command, /ps -e -o pid= -o ppid= -o stat= -o comm=/);
+  assert.equal(command.includes("pid=,"), false);
 });
 
 test("immediate parked reconnect does not guess cwd from an exiting shell", async () => {

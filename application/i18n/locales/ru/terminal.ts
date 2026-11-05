@@ -1,6 +1,15 @@
 import type { Messages } from '../types';
 
 export const ruTerminalMessages: Messages = {
+  'terminal.toolbar.openSessionLog': 'Открыть журнал сессии',
+  'terminal.toolbar.sessionLogActions': 'Действия с журналом',
+  'terminal.toolbar.sessionLog.menu': 'Журнал сессии',
+  'terminal.toolbar.sessionLog.open': 'Открыть',
+  'terminal.toolbar.sessionLog.reveal': 'Показать в папке',
+  'terminal.toolbar.sessionLog.chooseApplication': 'Открыть с помощью…',
+  'terminal.toolbar.sessionLog.systemDefault': 'Открыть по умолчанию',
+  'terminal.toolbar.openSessionLogFailed': 'Не удалось открыть журнал.',
+
   'terminal.menu.saveScreen': 'Сохранить текущий экран',
   'terminal.saveScreen.failed': 'Не удалось сохранить экран терминала.',
   // Диалог подтверждения многострочной вставки (#3398)
@@ -89,6 +98,8 @@ export const ruTerminalMessages: Messages = {
   'terminal.composeBar.send': 'Отправить',
   'terminal.composeBar.close': 'Закрыть строку ввода',
   'terminal.composeBar.broadcasting': 'Трансляция во все сессии',
+  'terminal.composeBar.sendToAll': 'Отправить во все сессии',
+  'terminal.composeBar.sendToActive': 'Отправить только в активную сессию',
   'terminal.composeBar.broadcastAllowPassword': 'Транслировать без защиты пароля',
   'terminal.composeBar.resize': 'Изменить высоту строки ввода',
   'terminal.composeBar.manageSnippets': 'Управление быстрыми сниппетами',
@@ -130,6 +141,8 @@ export const ruTerminalMessages: Messages = {
   'terminal.serverStats.cpu': 'Использование CPU',
   'terminal.serverStats.cpuCores': 'Использование ядер CPU',
   'terminal.serverStats.gpu': 'Использование GPU',
+  'terminal.serverStats.gpuDevices': 'Использование видеокарт',
+  'terminal.serverStats.gpuIndex': 'GPU {{index}}',
   'terminal.serverStats.memory': 'Использование памяти',
   'terminal.serverStats.memoryDetails': 'Сведения о памяти',
   'terminal.serverStats.memUsed': 'Использовано',
@@ -465,6 +478,7 @@ export const ruTerminalMessages: Messages = {
   'cloudSync.localBackups.clearFailed': 'Не удалось удалить все локальные копии. Повторите попытку.',
   'cloudSync.localBackups.title': 'История локальных резервных копий',
   'cloudSync.localBackups.desc': 'Netcatty сохраняет локальные точки восстановления перед сменой версии приложения и перед восстановлением хранилища.',
+  'cloudSync.localBackups.folderWarning': 'Эта папка сама по себе не является полной переносимой резервной копией. Удаление или очистка профиля приложения (userData) может сделать эти точки восстановления нечитаемыми.',
   'cloudSync.localBackups.retentionTitle': 'Хранение резервных копий',
   'cloudSync.localBackups.retentionDesc': 'Выберите, сколько локальных резервных копий должен хранить Netcatty.',
   'cloudSync.localBackups.maxCount': 'Макс. число копий',
@@ -479,6 +493,7 @@ export const ruTerminalMessages: Messages = {
   'cloudSync.localBackups.restoreSuccess': 'Локальная резервная копия восстановлена.',
   'cloudSync.localBackups.restoreFailedTitle': 'Ошибка восстановления',
   'cloudSync.localBackups.restoreMissing': 'Резервная копия не найдена.',
+  'cloudSync.localBackups.decryptFailed': 'Текущий профиль приложения не может расшифровать эту копию. Возможно, отсутствует ключ шифрования, профиль изменился или копия повреждена.',
   'cloudSync.localBackups.protectiveBackupFailed': 'Не удалось создать защитную резервную копию, поэтому восстановление было прервано для защиты ваших текущих данных. Устраните основную проблему (например, доступ к keychain) и попробуйте снова. Подробности: {message}',
   'cloudSync.localBackups.restoreConfirmTitle': 'Восстановить эту резервную копию?',
   'cloudSync.localBackups.restoreConfirmDesc': 'Ваши текущие хосты, ключи, сниппеты и настройки будут заменены содержимым этой резервной копии. Перед этим автоматически создаётся защитный снимок текущих данных.',
@@ -873,6 +888,7 @@ export const ruTerminalMessages: Messages = {
   'serial.field.flowControl': 'Управление потоком',
   'serial.noPorts': 'Последовательные порты не обнаружены. Подключите устройство и обновите список.',
   'serial.field.customPort': 'Путь к пользовательскому порту',
+  'serial.field.namedPipeHint': 'Консоль ВМ Windows: введите \\\\.\\pipe\\name. ВМ должна создать канал как сервер. Скорость и параметры кадра игнорируются.',
   'serial.field.customPortPlaceholder': 'например, /dev/ttys001 или COM1',
   'serial.type.hardware': 'Аппаратный',
   'serial.type.pseudo': 'Псевдотерминал',
@@ -917,11 +933,13 @@ export const ruTerminalMessages: Messages = {
   'keyboard.interactive.desc': 'Сервер требует дополнительную аутентификацию.',
   'keyboard.interactive.descWithHost': 'Сервер {hostname} требует дополнительную аутентификацию.',
   'keyboard.interactive.response': 'Ответ',
+  'keyboard.interactive.verificationCode': 'Код подтверждения',
   'keyboard.interactive.enterCode': 'Введите код подтверждения',
   'keyboard.interactive.enterResponse': 'Введите ответ',
   'keyboard.interactive.submit': 'Отправить',
   'keyboard.interactive.verifying': 'Проверка...',
   'keyboard.interactive.savePassword': 'Сохранить пароль',
+  'keyboard.interactive.fillTotp': 'Подставить код подтверждения',
 
   // Passphrase Modal for encrypted SSH keys
   'passphrase.title': 'Парольная фраза SSH-ключа',

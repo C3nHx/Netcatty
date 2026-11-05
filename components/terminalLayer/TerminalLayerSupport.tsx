@@ -43,6 +43,7 @@ import type { TerminalContextReader } from '../../domain/terminalContextRead';
 import {
   getTerminalPaneRenderSnapshot,
   parseTerminalPaneRenderSnapshot,
+  resolveTerminalPaneInputProps,
   resolveInactiveTerminalPaneStyle,
   shouldUseTerminalPaneSplitLayout,
   type TerminalPaneHiddenSize,
@@ -282,6 +283,8 @@ interface AIChatPanelsHostProps {
   mountedTabIds: string[];
   activeTabId: string | null;
   activeSidePanelTab: SidePanelTab | null;
+  /** All live terminal+workspace target ids (for /chats dangling detection). */
+  liveScopeTargetIds: Set<string>;
   contextsByTabId: Map<string, AIPanelContext>;
   resolveExecutorContext: (scope: {
     type: 'terminal' | 'workspace';
@@ -297,6 +300,8 @@ interface AIChatPanelsHostProps {
   onOpenVaultHostFromChat?: (hostId: string) => void;
   onOpenVaultSectionFromChat?: (section: 'notes' | 'hosts' | 'snippets') => void;
   onOpenVaultSnippetFromChat?: (snippetId: string) => void;
+  /** Live workspaces, threaded to AI chats for `/chats` scope titles. */
+  workspaces?: Workspace[] | null;
 }
 
 const EMPTY_WORKSPACES: Workspace[] = [];
@@ -449,6 +454,7 @@ function aiChatPanelsHostAreEqual(
   next: AIChatPanelsHostProps,
 ): boolean {
   if (prev.mountedTabIds !== next.mountedTabIds) return false;
+  if (prev.liveScopeTargetIds !== next.liveScopeTargetIds) return false;
   if (prev.contextsByTabId !== next.contextsByTabId) return false;
   if (prev.activeSidePanelTab !== next.activeSidePanelTab) return false;
   if (prev.pendingTerminalSelection !== next.pendingTerminalSelection) return false;
@@ -461,6 +467,7 @@ function aiChatPanelsHostAreEqual(
   if (prev.onOpenVaultHostFromChat !== next.onOpenVaultHostFromChat) return false;
   if (prev.onOpenVaultSectionFromChat !== next.onOpenVaultSectionFromChat) return false;
   if (prev.onOpenVaultSnippetFromChat !== next.onOpenVaultSnippetFromChat) return false;
+  if (prev.workspaces !== next.workspaces) return false;
   if (prev.activeTabId === next.activeTabId) return true;
 
   for (let i = 0; i < prev.mountedTabIds.length; i += 1) {
@@ -488,6 +495,7 @@ const AIChatPanelsHostInner: React.FC<AIChatPanelsHostProps> = ({
   mountedTabIds,
   activeTabId,
   activeSidePanelTab,
+  liveScopeTargetIds,
   contextsByTabId,
   resolveExecutorContext,
   pendingTerminalSelection,
@@ -499,6 +507,7 @@ const AIChatPanelsHostInner: React.FC<AIChatPanelsHostProps> = ({
   onOpenVaultHostFromChat,
   onOpenVaultSectionFromChat,
   onOpenVaultSnippetFromChat,
+  workspaces,
 }) => {
   const aiConfig = useContext(AIConfigContext);
 
@@ -516,6 +525,10 @@ const AIChatPanelsHostInner: React.FC<AIChatPanelsHostProps> = ({
     showDraftView,
     updateDraft,
   } = aiConfig;
+  const aiPanelWorkspaces = useMemo(
+    () => (workspaces ?? []).map((workspace) => ({ id: workspace.id, title: workspace.title })),
+    [workspaces],
+  );
 
   useEffect(() => {
     if (!pendingTerminalSelection) return;
@@ -587,6 +600,9 @@ const AIChatPanelsHostInner: React.FC<AIChatPanelsHostProps> = ({
                     undoLastTurnInSession={aiConfig.undoLastTurnInSession}
                     deleteSession={aiConfig.deleteSession}
                     updateSessionTitle={aiConfig.updateSessionTitle}
+                    rebindSessionScope={aiConfig.rebindSessionScope}
+                    exportSessionsBackup={aiConfig.exportSessionsBackup}
+                    importSessionsBackup={aiConfig.importSessionsBackup}
                     updateSessionExternalSessionId={aiConfig.updateSessionExternalSessionId}
                     addMessageToSession={aiConfig.addMessageToSession}
                     updateLastMessage={aiConfig.updateLastMessage}
@@ -620,7 +636,9 @@ const AIChatPanelsHostInner: React.FC<AIChatPanelsHostProps> = ({
                     scopeHostIds={context.scopeHostIds}
                     scopeLabel={context.scopeLabel}
                     focusedSessionId={context.focusedSessionId}
+                    workspaces={aiPanelWorkspaces}
                     terminalSessions={context.terminalSessions}
+                    liveScopeTargetIds={liveScopeTargetIds}
                     resolveExecutorContext={resolveExecutorContext}
                     isVisible={isVisible}
                     notes={notes}
@@ -696,7 +714,7 @@ export interface TerminalLayerProps {
   onCommandExecuted?: (command: string, hostId: string, hostLabel: string, sessionId: string) => void;
   onDeleteShellHistoryEntry?: (entryId: string) => void;
   onClearCommandHistory?: () => void;
-  onTerminalDataCapture?: (sessionId: string, data: string) => void;
+  onTerminalDataCapture?: (sessionId: string, data: string) => void | Promise<void>;
   onCreateWorkspaceFromSessions: (baseSessionId: string, joiningSessionId: string, hint: Exclude<SplitHint, null>) => void;
   onAddSessionToWorkspace: (workspaceId: string, sessionId: string, hint: Exclude<SplitHint, null>) => void;
   onRequestAddToWorkspace?: (workspaceId: string) => void;
@@ -719,10 +737,14 @@ export interface TerminalLayerProps {
   onCreateLocalTerminal?: () => void;
   // Broadcast mode
   isBroadcastEnabled?: (workspaceId: string) => boolean;
+  isComposeSendToAll?: (workspaceId: string) => boolean;
+  onToggleComposeSendTarget?: (workspaceId: string) => void;
   isGlobalBroadcastEnabled?: boolean;
+  isGlobalComposeSendToAll?: boolean;
   canUseGlobalBroadcast?: boolean;
   onToggleBroadcast?: (workspaceId: string) => void;
   onToggleGlobalBroadcast?: () => void;
+  onToggleGlobalComposeSendTarget?: () => void;
   // SFTP side panel
   updateHosts: (hosts: Host[]) => void;
   updateSnippets?: (snippets: Snippet[]) => void;
@@ -815,7 +837,7 @@ interface TerminalPaneProps {
   onCloseSession: (sessionId: string) => void;
   onStatusChange: (sessionId: string, status: TerminalSession['status'], sftpHost?: Host) => void;
   onSessionExit: (sessionId: string, evt: TerminalSessionExitEvent) => void;
-  onTerminalDataCapture?: (sessionId: string, data: string) => void;
+  onTerminalDataCapture?: (sessionId: string, data: string) => void | Promise<void>;
   onOsDetected: (hostId: string, distro: string) => void;
   onUpdateHost: (host: Host) => void;
   onAddKnownHost?: (knownHost: KnownHost) => void;
@@ -824,9 +846,12 @@ interface TerminalPaneProps {
   onSetWorkspaceFocusedSession?: (workspaceId: string, sessionId: string) => void;
   onSplitSession?: (sessionId: string, direction: SplitDirection) => void;
   isBroadcastEnabled?: (workspaceId: string) => boolean;
+  isComposeSendToAll?: (workspaceId: string) => boolean;
   isGlobalBroadcastEnabled?: boolean;
+  isGlobalComposeSendToAll?: boolean;
   canUseGlobalBroadcast?: boolean;
   onToggleGlobalBroadcast?: () => void;
+  onToggleGlobalComposeSendTarget?: () => void;
   onBroadcastInput: (
     data: string,
     sourceSessionId: string,
@@ -952,9 +977,12 @@ const terminalPanePropsAreEqual = (
   prev.onSetWorkspaceFocusedSession === next.onSetWorkspaceFocusedSession &&
   prev.onSplitSession === next.onSplitSession &&
   prev.isBroadcastEnabled === next.isBroadcastEnabled &&
+  prev.isComposeSendToAll === next.isComposeSendToAll &&
   prev.isGlobalBroadcastEnabled === next.isGlobalBroadcastEnabled &&
+  prev.isGlobalComposeSendToAll === next.isGlobalComposeSendToAll &&
   prev.canUseGlobalBroadcast === next.canUseGlobalBroadcast &&
   prev.onToggleGlobalBroadcast === next.onToggleGlobalBroadcast &&
+  prev.onToggleGlobalComposeSendTarget === next.onToggleGlobalComposeSendTarget &&
   prev.onBroadcastInput === next.onBroadcastInput &&
   prev.onBroadcastInterruptPriorityChange === next.onBroadcastInterruptPriorityChange &&
   prev.onToggleWorkspaceComposeBar === next.onToggleWorkspaceComposeBar &&
@@ -1253,9 +1281,12 @@ const TerminalPane: React.FC<TerminalPaneProps> = memo(({
   onSetWorkspaceFocusedSession,
   onSplitSession,
   isBroadcastEnabled,
+  isComposeSendToAll,
   isGlobalBroadcastEnabled,
+  isGlobalComposeSendToAll,
   canUseGlobalBroadcast,
   onToggleGlobalBroadcast,
+  onToggleGlobalComposeSendTarget,
   onBroadcastInput,
   onBroadcastInterruptPriorityChange,
   onToggleWorkspaceComposeBar,
@@ -1283,7 +1314,9 @@ const TerminalPane: React.FC<TerminalPaneProps> = memo(({
     [isTerminalLayerVisible, session.id, session.workspaceId, workspaceById],
   );
   const renderSnapshot = useSyncExternalStore(activeTabStore.subscribe, getRenderSnapshot, getRenderSnapshot);
-  const { paneState, isFocusedPane } = parseTerminalPaneRenderSnapshot(renderSnapshot);
+  const parsedPane = parseTerminalPaneRenderSnapshot(renderSnapshot);
+  const { paneState, isFocusedPane } = parsedPane;
+  const terminalInputProps = resolveTerminalPaneInputProps(parsedPane);
   // Live titles/icons are store-driven; per-session snapshot so other panes do
   // not re-render when only a sibling title changes.
   const presentedSession = usePresentedSession(session);
@@ -1485,6 +1518,12 @@ const TerminalPane: React.FC<TerminalPaneProps> = memo(({
   const broadcastEnabled = activeWorkspaceId
     ? !!isBroadcastEnabled?.(activeWorkspaceId)
     : (isGlobalBroadcastEnabled ?? false);
+  const composeSendToAll = activeWorkspaceId
+    ? !!isComposeSendToAll?.(activeWorkspaceId)
+    : !!isGlobalComposeSendToAll;
+  const toggleComposeSendTarget = !activeWorkspaceId && canUseGlobalBroadcast
+    ? onToggleGlobalComposeSendTarget
+    : undefined;
   const isHostEphemeral = !isSavedVaultHost(hostMap.get(host.id));
   const sessionAppearance = useMemo(
     () => resolveSessionAppearance({ host, isEphemeral: isHostEphemeral }),
@@ -1571,14 +1610,12 @@ const TerminalPane: React.FC<TerminalPaneProps> = memo(({
         chainHosts={chainHosts}
         appearanceTheme={sessionAppearanceTheme}
         knownHosts={knownHosts}
-        isVisible={isVisible}
+        {...terminalInputProps}
         paneLayoutKey={paneLayoutKey}
         inWorkspace={keepsWorkspacePresentation}
         isResizing={isResizing}
         isFocusMode={layoutWorkspace?.viewMode === 'focus'}
         isPaneMagnified={isMagnified}
-        isFocused={isFocusedPane}
-        isFocusedPane={isSplitViewVisible ? isFocusedPane : undefined}
         fontFamilyId={terminalFontFamilyId}
         fontSize={fontSize}
         terminalTheme={terminalTheme}
@@ -1630,6 +1667,8 @@ const TerminalPane: React.FC<TerminalPaneProps> = memo(({
         onSplitHorizontal={onSplitSession ? splitHorizontalHandler : undefined}
         onSplitVertical={onSplitSession ? splitVerticalHandler : undefined}
         isBroadcastEnabled={broadcastEnabled}
+        composeSendToAll={inActiveWorkspace ? undefined : composeSendToAll}
+        onToggleComposeSendTarget={toggleComposeSendTarget}
         onToggleBroadcast={
           inActiveWorkspace
             ? workspaceBroadcastHandler
@@ -1637,7 +1676,7 @@ const TerminalPane: React.FC<TerminalPaneProps> = memo(({
         }
         onToggleComposeBar={inActiveWorkspace ? onToggleWorkspaceComposeBar : undefined}
         isWorkspaceComposeBarOpen={inActiveWorkspace ? isComposeBarOpen : undefined}
-        onBroadcastInput={broadcastEnabled ? onBroadcastInput : undefined}
+        onBroadcastInput={onBroadcastInput}
         onBroadcastInterruptPriorityChange={onBroadcastInterruptPriorityChange}
         onSnippetExecutorChange={onSnippetExecutorChange}
         onProgrammaticCommandLogRewriteChange={onProgrammaticCommandLogRewriteChange}
@@ -1717,7 +1756,7 @@ interface TerminalPanesHostProps {
   onCloseSession: (sessionId: string) => void;
   onStatusChange: (sessionId: string, status: TerminalSession['status'], sftpHost?: Host) => void;
   onSessionExit: (sessionId: string, evt: TerminalSessionExitEvent) => void;
-  onTerminalDataCapture?: (sessionId: string, data: string) => void;
+  onTerminalDataCapture?: (sessionId: string, data: string) => void | Promise<void>;
   onOsDetected: (hostId: string, distro: string) => void;
   onUpdateHost: (host: Host) => void;
   onAddKnownHost?: (knownHost: KnownHost) => void;
@@ -1726,9 +1765,12 @@ interface TerminalPanesHostProps {
   onSetWorkspaceFocusedSession?: (workspaceId: string, sessionId: string) => void;
   onSplitSession?: (sessionId: string, direction: SplitDirection) => void;
   isBroadcastEnabled?: (workspaceId: string) => boolean;
+  isComposeSendToAll?: (workspaceId: string) => boolean;
   isGlobalBroadcastEnabled?: boolean;
+  isGlobalComposeSendToAll?: boolean;
   canUseGlobalBroadcast?: boolean;
   onToggleGlobalBroadcast?: () => void;
+  onToggleGlobalComposeSendTarget?: () => void;
   onBroadcastInput: (
     data: string,
     sourceSessionId: string,
@@ -1816,9 +1858,12 @@ const terminalPanesHostPropsAreEqual = (
   if (prev.onSetWorkspaceFocusedSession !== next.onSetWorkspaceFocusedSession) return false;
   if (prev.onSplitSession !== next.onSplitSession) return false;
   if (prev.isBroadcastEnabled !== next.isBroadcastEnabled) return false;
+  if (prev.isComposeSendToAll !== next.isComposeSendToAll) return false;
   if (prev.isGlobalBroadcastEnabled !== next.isGlobalBroadcastEnabled) return false;
+  if (prev.isGlobalComposeSendToAll !== next.isGlobalComposeSendToAll) return false;
   if (prev.canUseGlobalBroadcast !== next.canUseGlobalBroadcast) return false;
   if (prev.onToggleGlobalBroadcast !== next.onToggleGlobalBroadcast) return false;
+  if (prev.onToggleGlobalComposeSendTarget !== next.onToggleGlobalComposeSendTarget) return false;
   if (prev.onBroadcastInput !== next.onBroadcastInput) return false;
   if (prev.onBroadcastInterruptPriorityChange !== next.onBroadcastInterruptPriorityChange) return false;
   if (prev.onToggleWorkspaceComposeBar !== next.onToggleWorkspaceComposeBar) return false;

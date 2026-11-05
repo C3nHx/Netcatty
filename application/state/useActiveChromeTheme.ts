@@ -1,3 +1,6 @@
+import { pluginThemeRegistry } from '../../infrastructure/config/pluginThemeRegistry';
+import { usePluginThemeRevision } from './usePluginThemeRuntime';
+import { getSettingsChromeSnapshot, useSettingsChromeStore } from './settingsChromeStore';
 import { useLayoutEffect, useRef } from "react";
 import type { TerminalTheme } from "../../domain/models";
 import {
@@ -236,7 +239,9 @@ function applyActiveChromeTheme(theme: TerminalTheme) {
 function refreshActiveChromeThemeSurfaces(theme: TerminalTheme) {
   const targetClass = theme.type === "dark" ? "dark" : "light";
   if (typeof window !== "undefined") {
-    netcattyBridge.get()?.setTheme?.(targetClass);
+    // Preserve OS preference events instead of locking nativeTheme to the chrome type.
+    const themeSource = getSettingsChromeSnapshot().theme === "system" ? "system" : targetClass;
+    netcattyBridge.get()?.setTheme?.(themeSource);
     netcattyBridge.get()?.setBackgroundColor?.(theme.colors.background);
   }
   applyTopTabsChromeThemeVars(theme);
@@ -271,12 +276,15 @@ export function useActiveChromeTheme({
   activeTheme: TerminalTheme | null;
   applyAppTheme: () => void;
 }) {
+  const pluginThemeRevision = usePluginThemeRevision();
+  const { resolvedTheme } = useSettingsChromeStore();
+  const effectiveTheme = pluginThemeRegistry.isActive(resolvedTheme) ? null : activeTheme;
   const applyAppThemeRef = useRef(applyAppTheme);
   applyAppThemeRef.current = applyAppTheme;
 
   useLayoutEffect(() => {
-    syncActiveChromeTheme(activeTheme, applyAppTheme);
-  }, [activeTheme, applyAppTheme]);
+    syncActiveChromeTheme(effectiveTheme, applyAppTheme);
+  }, [effectiveTheme, applyAppTheme, pluginThemeRevision]);
 
   useLayoutEffect(() => {
     return () => {

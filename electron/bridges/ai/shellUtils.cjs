@@ -61,10 +61,63 @@ const POWERSHELL_PROMPT_PATTERN = /^PS(?:\s+\S.*)?>$/;
 // PowerShell's `PS C:\...>` (handled by POWERSHELL_PROMPT_PATTERN first).
 const CMD_PROMPT_PATTERN = /^[A-Za-z]:(?:\\[^<>"|]*)?>$/;
 
-// Classic `user@host:...$` / `user@host:...#` login prompt (bash/zsh in WSL,
-// remote Linux, etc.). Intentionally narrow so custom / fish prompts do not
-// flip a Windows DefaultShell soft hint.
-const POSIX_PROMPT_PATTERN = /^[^\s@]+@[^\s:]+(?::[^\n\r]*)?[#$]$/;
+// Default login prompts, kept narrow so custom / fish / starship prompts do
+// not flip a Windows DefaultShell soft hint:
+//   - bash/zsh `user@host[:path][#$]` (colon before the path; `root@host ~#` stays rejected)
+//   - RHEL-family `[\u@\h \W]\$` -> `[user@host path][#$]`, or `[user@host][#$]`
+//     with no path. `\W` may contain whitespace or `]` (`[user@host My [Project]]$`);
+//     the final `]` before `$`/`#` is the delimiter.
+const POSIX_PROMPT_PATTERN = /^(?:[^\s@]+@[^\s:]+(?::[^\n\r]*)?|\[[^\s@\]]+@[^\s\]:]+(?:\s+[^\n\r]+)?\])[#$]$/;
+
+// macOS ships zsh with `%n@%m %1~ %#`, which renders as
+// `user@host ~ %` / `user@host My Project %`; privileged shells end in `#`.
+// Allow spaces in the path, but keep prompt delimiters excluded so a prompt
+// followed by input (`user@host ~ % echo %`) cannot count as idle. Requiring
+// whitespace before the marker also rejects output such as `user@host 100%`.
+const ZSH_PROMPT_PATTERN = /^[^\s@]+@[^\s:]+ [^\s%#$][^%#$\r\n]* [%#]$/;
+
+// SteamOS/Deck-style prompt: `(user@host path)$`. Allow markers and balanced
+// single-level parentheses in the path, but not an early closing delimiter:
+// otherwise a prompt followed by pending input could look like an idle prompt.
+const PAREN_POSIX_PROMPT_PATTERN = /^\([^\s@()]+@[^\s:()]+\s+(?:[^()\r\n]|\([^()\r\n]*\))+\)[#$]$/;
+
+// Host line of a two-line bash PS1 (`\u@\h: \w` then a following `$` or `#`).
+// Same user@host[:path] class as POSIX_PROMPT_PATTERN's first alternative,
+// without a prompt marker on this line. Oh My Zsh `ys` uses a different host
+// line (`# user @ host ...`), matched separately below. A bare `$`/`#` alone
+// is not a prompt.
+const POSIX_PROMPT_HOST_LINE_PATTERN = /^[^\s@]+@[^\s:]+(?::[^\n\r]*)?$/;
+
+// Oh My Zsh `ys` status line: a decorative `#`, then `user @ host` with
+// spaces around `@`, then an optional remainder (directory, git, venv, time,
+// exit code). Example: `# user @ host in ~ [12:34:56]`. Arbitrary text before
+// a bare `$`/`#` still does not match.
+const OH_MY_ZSH_YS_HOST_LINE_PATTERN = /^#\s+[^\s@]+\s+@\s+[^\s]+(?:\s+[^\n\r]+)?$/;
+
+// Alpine's default ash PS1 omits the username: `\h:\w\$ ` -> `localhost:~# `.
+// Require a hostname and a home/absolute path, excluding prompt delimiters
+// within the path so partially entered commands do not count as idle prompts.
+const ALPINE_PROMPT_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9_.-]*:(?:~(?:\/[^#$\n\r]*)?|\/[^#$\n\r]*)[#$]$/;
+
+// Powerlevel10k / similar Unicode prompt-ending ❯ (U+276F). Common idle forms:
+// `~ ❯`, `~/path ❯`, `/tmp ❯`, short-dir `proj ❯`, optional `user@host `
+// prefix (`alice@host ~ ❯`). Require a non-empty prefix and whitespace before
+// ❯ so pending input (`~ ❯ echo READY`, `❯ vim`) cannot match. Bare `❯` alone
+// is intentionally rejected — too ambiguous without a path/host prefix
+// (same rationale as bare `$`/`#`). Do not attempt two-line bare-❯ here.
+const POWERLEVEL10K_PROMPT_PATTERN =
+  /^(?:[^\s@]+@[^\s:]+\s+)?[^\s❯][^❯\r\n]*\s+❯$/;
+
+// Oh My Zsh default theme (robbyrussell): leading ➜ (U+279C) then cwd (%c),
+// optionally ` git:(branch)` and a dirty/clean marker. Idle forms look like
+// `➜  ~`, `➜  netcatty`, `➜  ~ git:(main)`, `➜  ~ git:(main) ✗`.
+// The theme emits two spaces between ➜ and %c (`➜ ` + ` %c`); require that
+// so one-space pending input like `➜ ls` cannot match. Also accept the common
+// single-space home form `➜ ~` (+ optional git). Only the optional git
+// decoration may follow the cwd — `➜  ~ ls` / `➜  ~ echo hi` fail.
+// Do not broaden to arbitrary starship themes.
+const OH_MY_ZSH_ROBBYRUSSELL_PROMPT_PATTERN =
+  /^➜(?:\s{2,}[^\s➜][^\s➜]*|\s~)(?:\s+git:\([^)\r\n]+\))?(?:\s+[✗✓])?$/;
 
 function isDefaultPowerShellPromptLine(line) {
   return POWERSHELL_PROMPT_PATTERN.test(String(line || ""));
@@ -75,7 +128,19 @@ function isDefaultCmdPromptLine(line) {
 }
 
 function isDefaultPosixPromptLine(line) {
-  return POSIX_PROMPT_PATTERN.test(String(line || "").replace(/\s+$/, ""));
+  const normalized = String(line || "").replace(/\s+$/, "");
+  // Optional virtualenv / conda / BT-panel style env name prefix: "(name) "
+  // before the shell prompt. Recognition only; callers still return the full
+  // prompt line so suffix matching sees the visible prefix (#3947).
+  const withoutEnvPrefix = normalized.replace(/^\([^()\n\r]+\)\s+/, "");
+  return (
+    POSIX_PROMPT_PATTERN.test(withoutEnvPrefix) ||
+    PAREN_POSIX_PROMPT_PATTERN.test(withoutEnvPrefix) ||
+    ALPINE_PROMPT_PATTERN.test(withoutEnvPrefix) ||
+    ZSH_PROMPT_PATTERN.test(withoutEnvPrefix) ||
+    POWERLEVEL10K_PROMPT_PATTERN.test(withoutEnvPrefix) ||
+    OH_MY_ZSH_ROBBYRUSSELL_PROMPT_PATTERN.test(withoutEnvPrefix)
+  );
 }
 
 function extractTrailingIdlePrompt(output) {
@@ -86,7 +151,8 @@ function extractTrailingIdlePrompt(output) {
   const normalized = stripAnsi(output).replace(/\r/g, "\n");
   if (!normalized || normalized.endsWith("\n")) return "";
 
-  const lastLine = normalized.split("\n").pop() || "";
+  const lines = normalized.split("\n");
+  const lastLine = lines.pop() || "";
   const rightTrimmed = lastLine.replace(/\s+$/, "");
   if (!rightTrimmed) return "";
 
@@ -100,6 +166,33 @@ function extractTrailingIdlePrompt(output) {
 
   if (isDefaultCmdPromptLine(rightTrimmed)) {
     return lastLine;
+  }
+
+  // Two-line PS1. Classic bash is `export PS1="\u@\h: \w\n$ "`. Oh My Zsh
+  // `ys` paints `# user @ host ...` and then a bare `$` or `#`. Bash emits
+  // the newline as CR and the PTY's ONLCR adds another, so the bytes are
+  // `\r\r\n`. The CR-to-LF normalize above turns that into blank lines
+  // between the host line and `$`/`#`. Keep those blanks in the cache:
+  // getFreshIdlePrompt uses the same normalize, and hasExpectedPromptSuffix
+  // compares this CR-as-LF form against live PTY bytes. A lone `$`/`#` must
+  // not satisfy endsWith; the previous non-empty line has to be a recognized
+  // host line (classic `user@host[:path]` or Oh My Zsh `ys`).
+  if (rightTrimmed === "$" || rightTrimmed === "#") {
+    let hostIndex = lines.length - 1;
+    while (hostIndex >= 0 && lines[hostIndex].replace(/\s+$/, "") === "") {
+      hostIndex -= 1;
+    }
+    const previousLine = hostIndex >= 0 ? lines[hostIndex] : "";
+    const previousRightTrimmed = previousLine.replace(/\s+$/, "");
+    // Same optional "(name) " env prefix as isDefaultPosixPromptLine (#3947).
+    // Recognition only; the returned prompt keeps the visible prefix.
+    const previousHostLine = previousRightTrimmed.replace(/^\([^()\n\r]+\)\s+/, "");
+    if (
+      POSIX_PROMPT_HOST_LINE_PATTERN.test(previousHostLine)
+      || OH_MY_ZSH_YS_HOST_LINE_PATTERN.test(previousHostLine)
+    ) {
+      return `${lines.slice(hostIndex).join("\n")}\n${lastLine}`;
+    }
   }
 
   return "";
@@ -134,7 +227,20 @@ function looksLikeIdleAutoLogout(outputTail) {
 function trackSessionIdlePrompt(session, chunk) {
   if (!session || typeof chunk !== "string" || !chunk) return "";
 
-  const nextTail = `${session._promptTrackTail || ""}${chunk}`.slice(-MAX_PROMPT_TRACK_TAIL);
+  const previousTail = session._promptTrackTail || "";
+  const combined = `${previousTail}${chunk}`;
+  const overflow = combined.length - MAX_PROMPT_TRACK_TAIL;
+  if (overflow > 0) {
+    // The kept tail no longer starts where the previous tail started. Replay
+    // the dropped prefix so an alternate-screen enter or leave that scrolls
+    // off is still the mode at the first kept byte.
+    const { alternateScreenActiveAfter } = require("../terminalLogSanitizer.cjs");
+    session._promptTrackAltScreenAtTailStart = alternateScreenActiveAfter(
+      combined.slice(0, overflow),
+      session._promptTrackAltScreenAtTailStart === true,
+    );
+  }
+  const nextTail = overflow > 0 ? combined.slice(overflow) : combined;
   session._promptTrackTail = nextTail;
 
   const prompt = extractTrailingIdlePrompt(nextTail);
@@ -149,8 +255,12 @@ function trackSessionIdlePrompt(session, chunk) {
 // Return `session.lastIdlePrompt` only if the PTY's recent rolling tail
 // still ends with it. The cached prompt is updated only when
 // extractTrailingIdlePrompt recognizes a known shape (PowerShell, cmd.exe,
-// or `user@host[:path][#$]`); a remote shell switch into another shell, an
-// oh-my-posh / starship / custom PS1, or any unrecognized prompt would
+// `user@host[:path][#$]`, two-line classic `user@host[:path]` or Oh My Zsh
+// `ys` (`# user @ host ...`) + `$`/`#`, RHEL `[user@host path][#$]`,
+// Alpine `host:path[#$]`, Powerlevel10k-style `... ❯`, or Oh My Zsh
+// robbyrussell `➜  …`);
+// a remote shell switch into another shell, an oh-my-posh / starship / custom
+// PS1, or any unrecognized prompt would
 // otherwise leave a stale value behind, which `resolveEffectiveShellKind`
 // would then keep using to coerce future commands into a PowerShell
 // wrapper. By re-checking the live tail we self-correct: if the visible
@@ -170,6 +280,34 @@ function getFreshIdlePrompt(session) {
   if (!normalizedCached) return "";
 
   return normalizedTail.endsWith(normalizedCached) ? cached : "";
+}
+
+// Readiness companion to getFreshIdlePrompt. PSReadLine echoes keys (including
+// the pending-input clear prefix) and then erases them with cursor-column +
+// ED/EL without appending a fresh copy of the prompt. stripAnsi removes the
+// erase, so the raw tail no longer ends with the cached prompt while the
+// screen is still an idle default prompt (#3927). Collapse those cursor and
+// erase operations, then accept only the line the cursor is actually on.
+function getVisibleIdlePrompt(session) {
+  const tail = session?._promptTrackTail;
+  if (typeof tail !== "string" || !tail) return "";
+
+  const { terminalCursorLine } = require("../terminalLogSanitizer.cjs");
+  const cursorLine = terminalCursorLine(tail, {
+    alternateScreenActive: session._promptTrackAltScreenAtTailStart === true,
+  });
+  const rightTrimmed = cursorLine.replace(/\s+$/, "");
+  if (!rightTrimmed) return "";
+  if (
+    !isDefaultPowerShellPromptLine(rightTrimmed)
+    && !isDefaultPosixPromptLine(rightTrimmed)
+    && !isDefaultCmdPromptLine(rightTrimmed)
+  ) {
+    return "";
+  }
+  // Keep one trailing space when the visible prompt has one. Erase-to-end
+  // padding must not become part of the expected prompt.
+  return /\s$/.test(cursorLine) ? `${rightTrimmed} ` : rightTrimmed;
 }
 
 // ── URL helpers ──
@@ -1112,6 +1250,7 @@ module.exports = {
   formatSyntheticEcho,
   extractTrailingIdlePrompt,
   getFreshIdlePrompt,
+  getVisibleIdlePrompt,
   isDefaultPowerShellPromptLine,
   isDefaultCmdPromptLine,
   isDefaultPosixPromptLine,

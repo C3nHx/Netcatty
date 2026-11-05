@@ -12,8 +12,9 @@ import type {
   TurnSteerResult,
 } from './turnDrivers/types';
 import { globalTwoPassCompactionCache } from './twoPassCompaction';
-import { redactSecretsForModel, redactSecretsInValueForModel } from './modelSecretRedaction';
+import { redactSecretsForModel, redactSecretsInValueForModel, setReversibleModelPrivacy } from './modelSecretRedaction';
 import { globalTerminalMonitorGuard } from './terminalMonitorGuard';
+import { netcattyBridge } from '../../services/netcattyBridge';
 
 let turnCounter = 0;
 
@@ -70,6 +71,8 @@ export class AgentRuntime {
   }
 
   clearChatSession(chatSessionId: string): void {
+    setReversibleModelPrivacy(chatSessionId, false);
+    void netcattyBridge.get()?.aiPrivacyClearSession?.(chatSessionId).catch(() => {});
     this.toolOutputStore.prune(chatSessionId);
     this.sessionStateStore.clear(chatSessionId);
     this.traceStore.clear(chatSessionId);
@@ -154,14 +157,14 @@ export class AgentRuntime {
       if (event.type === 'tool_result') {
         event = {
           ...event,
-          result: redactSecretsForModel(event.result),
+          result: redactSecretsForModel(event.result, input.backend === 'catty' ? chatSessionId : undefined),
         };
       }
 
       if (event.type === 'tool_call') {
         event = {
           ...event,
-          args: redactSecretsInValueForModel(event.args),
+          args: redactSecretsInValueForModel(event.args, input.backend === 'catty' ? chatSessionId : undefined),
         };
         toolCallMeta.set(event.toolCallId, {
           toolName: event.toolName,
@@ -173,6 +176,9 @@ export class AgentRuntime {
         const meta = toolCallMeta.get(event.toolCallId);
         const toolName = event.toolName ?? meta?.toolName;
         if (toolName) {
+          // SDKs such as Claude omit names on results. Publish the same
+          // per-turn correlation used below to downstream event consumers.
+          event = { ...event, toolName };
           sessionStateStore.updateFromToolResult(
             chatSessionId,
             toolName,

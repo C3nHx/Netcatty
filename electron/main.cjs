@@ -18,6 +18,10 @@ if (process.env.ELECTRON_RUN_AS_NODE) {
   delete process.env.ELECTRON_RUN_AS_NODE;
 }
 
+// Opt-in startup timeline (NETCATTY_PERF_TRACE=1); a no-op otherwise.
+const perfTrace = require("./perfTrace.cjs");
+perfTrace.mark("main:entry");
+
 // Load crash log bridge early so process-level error handlers can use it
 const crashLogBridge = require("./bridges/crashLogBridge.cjs");
 const {
@@ -97,9 +101,9 @@ const { PLUGIN_PROTOCOL_SCHEME } = require("./plugins/constants.cjs");
 const { runPluginShutdown } = require("./plugins/shutdownCoordinator.cjs");
 const {
   OPEN_TERMINAL_PATH_CHANNEL,
-  collectOpenTerminalPathArgs,
+  hasOpenTerminalLaunchArgs,
   resolveOpenTerminalPath,
-  resolveOpenTerminalPathsFromArgs,
+  resolveOpenTerminalRequestsFromArgs,
 } = require("./openTerminalPath.cjs");
 const {
   applyExplorerContextMenuPreference,
@@ -124,6 +128,10 @@ try {
         supportFetchAPI: true,
         corsEnabled: true,
         stream: true,
+        // Let V8 reuse compiled code for the renderer bundles across launches
+        // and windows (requires `standard`). Without it every window
+        // recompiles the multi-megabyte entry chunk from scratch.
+        codeCache: true,
       },
     },
     {
@@ -709,7 +717,7 @@ const rawLaunchArgvForHandoff = [...process.argv];
 // SecureCRT operands may contain PuTTY switch names; scrub them first.
 redactSecureCrtCommandLinePasswords(process.argv);
 redactPuttyCommandLinePasswords(process.argv);
-const pendingOpenTerminalPaths = resolveOpenTerminalPathsFromArgs(process.argv);
+const pendingOpenTerminalPaths = resolveOpenTerminalRequestsFromArgs(process.argv);
 let flushingSshDeepLinks = false;
 let flushingTelnetDeepLinks = false;
 let flushingOpenTerminalPaths = false;
@@ -744,7 +752,7 @@ function queueTelnetDeepLink(rawUrl, { viaCommandLine = false, tabName } = {}) {
 function queueOpenTerminalPath(rawPath, options = {}) {
   const resolvedPath = resolveOpenTerminalPath(rawPath, options);
   if (!resolvedPath) return;
-  pendingOpenTerminalPaths.push(resolvedPath);
+  pendingOpenTerminalPaths.push({ path: resolvedPath });
   if (app.isReady?.()) {
     void flushPendingOpenTerminalPaths();
   }
@@ -1092,13 +1100,17 @@ async function flushPendingTelnetDeepLinks() {
 }
 
 async function deliverOpenTerminalPath(targetPath) {
+  const request = typeof targetPath === "string" ? { path: targetPath } : (targetPath || {});
+  const payload = {};
+  if (typeof request.path === "string" && request.path) payload.path = request.path;
+  if (typeof request.shell === "string" && request.shell) payload.shell = request.shell;
   const win = await createAndShowMainWindow();
   focusMainWindow();
   const windowManager = getWindowManager();
   const result = await windowManager.sendWhenRendererReady?.(
     win,
     OPEN_TERMINAL_PATH_CHANNEL,
-    { path: targetPath },
+    payload,
     { timeoutMs: 0 },
   );
   if (result && result.success === false) {
@@ -1275,15 +1287,15 @@ if (!gotLock) {
       });
       return;
     }
-    if (collectOpenTerminalPathArgs(secondInstanceArgv).length > 0) {
+    if (hasOpenTerminalLaunchArgs(secondInstanceArgv)) {
       const baseDirectory = typeof workingDirectory === "string" ? workingDirectory : undefined;
-      const openTerminalPaths = resolveOpenTerminalPathsFromArgs(secondInstanceArgv, { baseDirectory });
+      const openTerminalPaths = resolveOpenTerminalRequestsFromArgs(secondInstanceArgv, { baseDirectory });
       if (openTerminalPaths.length > 0) {
         queueResolvedOpenTerminalPaths(openTerminalPaths);
       } else {
         // Still bring the app forward when Explorer launched us but the path
         // failed validation — silent no-op feels like a broken menu item.
-        console.warn("[Main] Open-terminal-path args present but no valid path resolved:", secondInstanceArgv);
+        console.warn("[Main] Open-terminal args present but no valid request resolved:", secondInstanceArgv);
         if (!focusMainWindow()) {
           // Explicit foreground request (a second instance launch): if a
           // still-pending hidden auto-launch cold start races ahead of the
@@ -1317,7 +1329,9 @@ if (!gotLock) {
   });
 
   // Application lifecycle
+  perfTrace.mark("main:modules-loaded");
   app.whenReady().then(async () => {
+    perfTrace.mark("main:when-ready");
     registerAppProtocol();
     const initialSshDeepLinkPreference = applyInitialSshDeepLinkPreference({
       enabled: sshDeepLinkEnabled,

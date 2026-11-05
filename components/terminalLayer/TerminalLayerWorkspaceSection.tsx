@@ -8,6 +8,7 @@ import {
 } from '../../application/state/sidePanelLiveStore';
 import { getPaneMagnificationShortcutLabel } from '../../domain/paneMagnification';
 import { terminalLayerWorkspaceCtxEqual } from './terminalLayerViewMemo';
+import { isSameSplitHint } from './splitHintEquality';
 
 type WorkspaceContext = Record<string, any>;
 
@@ -101,6 +102,8 @@ function TerminalLayerWorkspaceSectionInner({ ctx }: { ctx: WorkspaceContext }) 
     onSetWorkspaceFocusedSession,
     onSplitSession,
     isBroadcastEnabled,
+    isComposeSendToAll,
+    onToggleComposeSendTarget,
     handleBroadcastInput,
     handleBroadcastInterruptPriorityChange,
     handleToggleWorkspaceComposeBar,
@@ -124,8 +127,10 @@ function TerminalLayerWorkspaceSectionInner({ ctx }: { ctx: WorkspaceContext }) 
     onStartSessionDrag,
     onEndSessionDrag,
     isGlobalBroadcastEnabled,
+    isGlobalComposeSendToAll,
     canUseGlobalBroadcast,
     onToggleGlobalBroadcast,
+    onToggleGlobalComposeSendTarget,
     t,
   } = ctx;
 
@@ -158,7 +163,8 @@ function TerminalLayerWorkspaceSectionInner({ ctx }: { ctx: WorkspaceContext }) 
               e.preventDefault();
               e.stopPropagation();
               const hint = computeSplitHint(e);
-              setDropHint(hint);
+              // Only re-render the workspace when the preview actually moves.
+              setDropHint((prev) => (isSameSplitHint(prev, hint) ? prev : hint));
             }}
             onDragLeave={(e) => {
               if (!e.dataTransfer.types.includes('session-id')) return;
@@ -247,6 +253,9 @@ function TerminalLayerWorkspaceSectionInner({ ctx }: { ctx: WorkspaceContext }) 
           onSetWorkspaceFocusedSession={onSetWorkspaceFocusedSession}
           onSplitSession={onSplitSession}
           isBroadcastEnabled={isBroadcastEnabled}
+          isComposeSendToAll={isComposeSendToAll}
+          isGlobalComposeSendToAll={isGlobalComposeSendToAll}
+          onToggleGlobalComposeSendTarget={onToggleGlobalComposeSendTarget}
           onBroadcastInput={handleBroadcastInput}
           onBroadcastInterruptPriorityChange={handleBroadcastInterruptPriorityChange}
           onToggleWorkspaceComposeBar={handleToggleWorkspaceComposeBar}
@@ -349,6 +358,10 @@ function TerminalLayerWorkspaceSectionInner({ ctx }: { ctx: WorkspaceContext }) 
             refocusTerminalSession(focusedSessionId);
           }}
           isBroadcastEnabled={isBroadcastEnabled?.(activeWorkspace.id)}
+          composeSendToAll={isComposeSendToAll?.(activeWorkspace.id) ?? false}
+          onToggleComposeSendTarget={onToggleComposeSendTarget
+            ? () => onToggleComposeSendTarget(activeWorkspace.id)
+            : undefined}
           themeColors={composeBarThemeColors}
         />
       )}

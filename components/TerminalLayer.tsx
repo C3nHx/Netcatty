@@ -6,7 +6,6 @@ import { FolderTree, History, MessageSquare, PanelLeft, PanelRight, Palette, X, 
 import React, { memo, startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { activeTabStore } from '../application/state/activeTabStore';
 import { getScriptRecordingSnapshot } from '../application/state/scriptRecordingStore.ts';
-import { canReuseTerminalConnection } from '../application/state/terminalConnectionReuse';
 import { resolveTerminalSessionExitIntent, type TerminalSessionExitEvent } from '../application/state/resolveTerminalSessionExitIntent';
 import { prewarmAIStateStorageSnapshots } from '../application/state/aiStateSnapshots';
 import {
@@ -114,7 +113,7 @@ import {
   DEFAULT_TERMINAL_SIDE_PANEL_AUTO_OPEN_TAB,
   resolveSessionSidePanelAutoOpen,
 } from '../domain/terminalSidePanelAutoOpen';
-import { shouldProbeCommandCwd } from './terminalLayer/commandCwdProbe';
+import { canScheduleCommandCwdProbe, shouldProbeCommandCwd } from './terminalLayer/commandCwdProbe';
 import {
   resolvePreferredTerminalCwd,
   scheduleBackendCwdProbeAfterCommand,
@@ -124,6 +123,7 @@ import {
 import { classifyDistroId, hostRestrictsExtraSshChannels, shouldProbeSessionCwd } from '../domain/host';
 import {
   collectSidePanelPanes,
+  isPluginSidePanelTool,
   sidePanelLayoutHasTool,
   type SidePanelLayout,
   type SidePanelSplitDirection,
@@ -261,8 +261,12 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   onCreateLocalTerminal,
   isBroadcastEnabled,
   onToggleBroadcast,
+  isComposeSendToAll,
+  onToggleComposeSendTarget,
   isGlobalBroadcastEnabled,
+  isGlobalComposeSendToAll,
   onToggleGlobalBroadcast,
+  onToggleGlobalComposeSendTarget,
   canUseGlobalBroadcast,
   updateHosts,
   updateSnippets,
@@ -316,6 +320,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     splitPane: splitSidePanelPaneForTab,
     closePane: closeSidePanelPaneForTab,
     resizeSplit: resizeSidePanelSplitForTab,
+    selectSidePanelToolForTab,
   } = useTerminalSidePanelLayoutState();
   useEffect(() => {
     pruneComposeBarHistory(sessions.map((session) => session.id));
@@ -701,7 +706,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   }, [onAddKnownHost]);
 
   const handleTerminalDataCapture = useCallback((sessionId: string, data: string) => {
-    onTerminalDataCapture?.(sessionId, data);
+    return onTerminalDataCapture?.(sessionId, data);
   }, [onTerminalDataCapture]);
 
   // Terminal backend for broadcast writes
@@ -1278,6 +1283,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
       sourceSessionId,
       globalBroadcastEnabled: isGlobalBroadcastEnabled,
       directTargetSessionIds: options?.kittyKeyboardTargetSessionIds,
+      includeGlobalPeersWithoutToolbar: options?.composePeerFanOut === true,
     }).filter(id => !paced?.targets || paced.targets.some(target => target.sessionId === id));
     if (options?.preparePacedBroadcast && paced) {
       paced.targets = targetSessionIds.filter(id => passwordBypass || !isTerminalSensitiveInputActive(id)).map(id => {
@@ -1348,7 +1354,12 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
 
     const tabId = activeTabIdRef.current;
     const session = sessionsRef.current.find((candidate) => candidate.id === sessionId);
-    if (!session || !canReuseTerminalConnection(session)) return;
+    // Local POSIX shells do not emit OSC 7. They share this probe so session
+    // restore can `cd` back after restart (#1952). Prompt return calls this
+    // again with an empty command once the shell is idle, so a slow command
+    // such as `sleep 1; cd /tmp` is not recorded at the 150ms snapshot.
+    // SSH keeps the extra-exec eligibility check inside canScheduleCommandCwdProbe.
+    if (!session || !canScheduleCommandCwdProbe(session)) return;
     const sessionHost = sessionHostsMapRef.current.get(sessionId);
     const visibleSftpHost = tabId && sidePanelLayoutHasTool(sidePanelLayoutsRef.current.get(tabId), 'sftp')
       ? sftpHostForTabRef.current.get(tabId) ?? null
@@ -1372,6 +1383,8 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
       getSessionPwd: (id, options) => terminalBackend.getSessionPwd(id, options),
       canProbe: async () => {
         if (cwdProbeGenerationRef.current.get(sessionId) !== probeGeneration) return false;
+        // Local cwd is the PTY process directory, not an extra SSH channel.
+        if (session.protocol === "local") return true;
         const host = sessionHostsMapRef.current.get(sessionId);
         if (!host) return false;
         const hostDeviceClass = classifyDistroId(host.distro);
@@ -1594,7 +1607,15 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   }): Promise<string | null> => {
     const sessionId = getActiveTerminalSessionId();
     const host = sessionId ? sessionHostsMapRef.current.get(sessionId) : undefined;
-    const skipBackendPwd = hostRestrictsExtraSshChannels(host);
+    // Same rule as the terminal's own SFTP path lookup (#3631).
+    let skipBackendPwd = hostRestrictsExtraSshChannels(host);
+    if (!skipBackendPwd && sessionId && host) {
+      const info = await terminalBackend.getSessionRemoteInfo?.(sessionId).catch(() => null);
+      skipBackendPwd = !shouldProbeSessionCwd({
+        isNetworkDevice: classifyDistroId(host.distro) === 'network-device',
+        remoteSshVersion: info?.remoteSshVersion,
+      });
+    }
     return resolvePreferredTerminalCwd({
       rendererCwd: sessionId ? terminalRendererCwdBySessionRef.current.get(sessionId) : undefined,
       rendererCwdSource: sessionId
@@ -1733,13 +1754,9 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     if (!prepareSidePanelTool(tabId, tab)) return;
 
     startTransition(() => {
-      setSidePanelOpenTabs(prev => {
-        const next = new Map(prev);
-        next.set(tabId, tab);
-        return next;
-      });
+      selectSidePanelToolForTab(tabId, tab);
     });
-  }, [prepareSidePanelTool, setSidePanelOpenTabs, sidePanelOpenTabsRef]);
+  }, [prepareSidePanelTool, selectSidePanelToolForTab, sidePanelOpenTabsRef]);
 
   const handleFocusSidePanelPane = useCallback((paneId: string) => {
     const tabId = activeTabIdRef.current;
@@ -1916,6 +1933,16 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     if (!tabId) return;
     resizeSidePanelSplitForTab(tabId, splitId, sizes);
   }, [resizeSidePanelSplitForTab]);
+
+  const handleWithdrawPluginSidebarPane = useCallback((tabId: string, paneId: string, expectedTool: SidePanelTab) => {
+    if (!isPluginSidePanelTool(expectedTool)) return;
+    const layout = sidePanelLayoutsRef.current.get(tabId);
+    const pane = layout && collectSidePanelPanes(layout.root).find((item) => item.id === paneId);
+    if (pane?.tool !== expectedTool) return;
+    setMagnifiedPane((current) => current?.tabId === tabId && current.target.kind === 'side-panel'
+      && current.target.paneId === paneId ? null : current);
+    closeSidePanelPaneForTab(tabId, paneId);
+  }, [closeSidePanelPaneForTab, sidePanelLayoutsRef]);
 
   // Toggle SFTP from activity bar header
   const handleToggleSftpFromBar = useCallback(() => {
@@ -2449,14 +2476,19 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     let anyRecipientSensitive = false;
     const pendingSends: Promise<boolean>[] = [];
     const payload = text + '\r';
-    const broadcastEnabled = isBroadcastEnabled?.(activeWorkspace.id);
+    // Compose Enter follows the compose-bar target. Toolbar broadcast stays
+    // the keystroke switch and is only the fallback when no compose target
+    // has been published (older callers).
+    const composeSendToAll = isComposeSendToAll
+      ? isComposeSendToAll(activeWorkspace.id) === true
+      : Boolean(isBroadcastEnabled?.(activeWorkspace.id));
     const focusedSessionId = activeWorkspace.focusedSessionId;
     const broadcastPasswordBypass = broadcastPasswordBypassRef.current;
     const focusedSensitive = focusedSessionId
       ? isTerminalSensitiveInputActive(focusedSessionId)
       : false;
 
-    if (broadcastEnabled && (broadcastPasswordBypass || !focusedSensitive)) {
+    if (composeSendToAll && (broadcastPasswordBypass || !focusedSensitive)) {
       const allSessionIds = sessionsRef.current
         .filter((session) => session.workspaceId === activeWorkspace.id)
         .map((session) => session.id);
@@ -2504,7 +2536,9 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
         const executor = snippetExecutorsRef.current.get(targetId);
         if (executor) {
           const sensitive = isTerminalSensitiveInputActive(targetId);
-          pendingSends.push(Promise.resolve(executor(text, false)).then(
+          // Explicitly local: an omitted broadcast option falls back to the
+          // toolbar switch, which can still be on while compose is active-only.
+          pendingSends.push(Promise.resolve(executor(text, false, { broadcast: false })).then(
             (sent) => sent && !sensitive && !isTerminalSensitiveInputActive(targetId),
           ));
         } else {
@@ -2525,7 +2559,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     // eligibility for it.
     if (focusedSensitive || anyRecipientSensitive) return false;
     return delivered;
-  }, [isBroadcastEnabled, terminalBackend]);
+  }, [isBroadcastEnabled, isComposeSendToAll, terminalBackend]);
 
   const sessionLogConfig = useMemo(
     () => ({
@@ -2594,6 +2628,9 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     handleOpenAI,
     handleOpenSystem,
     handleOpenNotes,
+    getActiveTerminalSessionId,
+    handleSwitchSidePanelTab,
+    handleWithdrawPluginSidebarPane,
     handleOpenBrowser,
     handleFocusSidePanelPane,
     handleMagnifySidePanelPane,
@@ -2650,7 +2687,11 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     restoreTerminalCwd,
     identities,
     isBroadcastEnabled,
+    isComposeSendToAll,
+    onToggleComposeSendTarget,
     isGlobalBroadcastEnabled,
+    isGlobalComposeSendToAll,
+    onToggleGlobalComposeSendTarget,
     canUseGlobalBroadcast,
     isComposeBarOpen,
     keyBindings,
